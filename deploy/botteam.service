@@ -1,0 +1,24 @@
+[Unit]
+Description=Bot Team Director
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botteam
+SupplementaryGroups=docker
+WorkingDirectory=/opt/bot-team
+EnvironmentFile=/etc/botteam.env
+ExecStart=/opt/bot-team/.venv/bin/python -m botteam serve --config /opt/bot-team/bots.yaml --data /var/lib/botteam
+Restart=always
+RestartSec=3
+StateDirectory=botteam
+StateDirectoryMode=0700
+UMask=0022
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
