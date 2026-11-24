@@ -381,7 +381,26 @@ class Engine:
         try:
             context = {"goal": task["goal"], "mode": "demo" if self.model.offline else task["mode"],
                        "attachments": self.files(task_id)}
-            plan = validate_plan(self.model.plan(task_id, context, self.capabilities), self.capabilities)
+            with self.store.tx(write=False) as db:
+                feedback = db.execute("SELECT data FROM events WHERE task=? AND kind='plan_rejected' "
+                                      "ORDER BY seq DESC LIMIT 1", (task_id,)).fetchone()
+            if feedback:
+                context["plan_feedback"] = json.loads(feedback["data"])["error"]
+            candidate = self.model.plan(task_id, context, self.capabilities)
+            try:
+                plan = validate_plan(candidate, self.capabilities)
+            except (ValueError, TypeError, AttributeError) as exc:
+                if feedback or self.model.offline:
+                    raise
+                # A rejected proposal has no accepted steps or side effects. Allow one
+                # fresh plan with feedback, through the normal rate/budget scheduler.
+                with self.store.tx() as db:
+                    if self.task_row(db, task_id)["status"] in TERMINAL:
+                        return
+                    event(db, task_id, "plan_rejected", {"error": str(exc)[:600]})
+                    db.execute("UPDATE tasks SET planning=0,ready=0 WHERE id=?", (task_id,))
+                    self.refresh(db, task_id)
+                return
         except Exception as exc:
             self.director_error(task_id, "planning", exc)
             return
