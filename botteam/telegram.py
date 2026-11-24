@@ -504,6 +504,9 @@ class Telegram:
             approval = self.owned_approval(scope, data["approval"])
             if approval["state"] == "pending":
                 self.send_approval(scope, task, row["step"], approval["id"], json.loads(approval["action"]))
+        elif kind in {"approval_approved", "approval_rejected"}:
+            label = "Approved" if kind == "approval_approved" else "Rejected"
+            self.send(scope, f"{task[:8]} · {label}. Decision recorded; any old approval buttons are now stale.")
         elif kind == "step_completed":
             bot = data["bot"]
             topic = self.bot_topics.get(str(scope.chat), {}).get(bot, scope.topic)
