@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS telegram_voice (
 );
 CREATE INDEX IF NOT EXISTS telegram_voice_user_at ON telegram_voice(user_id,at);
 CREATE TABLE IF NOT EXISTS telegram_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS web_submissions (
+    request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, task TEXT NOT NULL REFERENCES tasks(id)
+);
 CREATE TABLE IF NOT EXISTS schedules (
     id TEXT PRIMARY KEY, goal TEXT NOT NULL, mode TEXT NOT NULL,
     interval_seconds INTEGER NOT NULL, next_at REAL NOT NULL, enabled INTEGER NOT NULL DEFAULT 1
