@@ -13,6 +13,7 @@ from .engine import Conflict, Engine
 from .settings import read_config
 from .store import encode
 from .telegram import Telegram
+from .web import WebAccess, dispatch_web
 
 LOG = logging.getLogger("botteam")
 MAX_REQUEST = 3_500_000
@@ -76,6 +77,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlsplit(self.path)
         parts = url.path.strip("/").split("/")
         engine = self.server.engine
+        if parts[0] == "ui":
+            return dispatch_web(self, parts[1:], url)
         if self.command == "GET" and parts == ["healthz"]:
             live = bool(engine.thread and engine.thread.is_alive() and time.monotonic() - engine.heartbeat < 15)
             sandbox = engine.tools.sandbox_ready()
@@ -167,6 +170,7 @@ class Server(ThreadingHTTPServer):
         self.token = token
         self.engine = engine
         self.telegram = telegram
+        self.web = WebAccess.from_env(telegram)
 
 
 def serve(args):
