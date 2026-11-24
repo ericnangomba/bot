@@ -54,6 +54,7 @@ class Engine:
         self.heartbeat = 0.0
         self.thread = None
         self.lock_file = None
+        self.submission_lock = threading.Lock()
 
     def start(self):
         self.lock_file = (self.root / "daemon.lock").open("a")
@@ -100,7 +101,12 @@ class Engine:
                    (task_id, goal, mode, "queued", now, now))
         event(db, task_id, "task_submitted", {"mode": mode})
 
-    def submit(self, goal, mode, attachments, telegram_origin=None):
+    def submit(self, goal, mode, attachments, telegram_origin=None, web_request=None, telegram_scope=None):
+        # Serialize intake before checking durable deduplication records, including Telegram retries.
+        with self.submission_lock:
+            return self._submit(goal, mode, attachments, telegram_origin, web_request, telegram_scope)
+
+    def _submit(self, goal, mode, attachments, telegram_origin, web_request, telegram_scope):
         self.validate_goal(goal, mode)
         if telegram_origin:
             update_id, *scope = telegram_origin
@@ -111,12 +117,26 @@ class Engine:
                 drafts = db.execute("SELECT name,content FROM telegram_drafts WHERE user_id=? AND chat_id=? "
                                     "AND topic=?", scope)
                 attachments = {**{row["name"]: row["content"] for row in drafts}, **attachments}
+        if web_request:
+            request_id, fingerprint = web_request
+            with self.store.tx(write=False) as db:
+                existing = db.execute("SELECT * FROM web_submissions WHERE request_id=?", (request_id,)).fetchone()
+                if existing:
+                    if existing["fingerprint"] != fingerprint:
+                        raise Conflict("Submission key already used for different content")
+                    return existing["task"]
         task = uuid.uuid4().hex
         workspace = self.projects / task
         try:
             save_attachments(workspace, attachments)
             with self.store.tx() as db:
                 self.insert_task(db, goal, mode, task)
+                if web_request:
+                    db.execute("INSERT INTO web_submissions VALUES(?,?,?)", (request_id, fingerprint, task))
+                if telegram_scope:
+                    # Negative update IDs cannot collide with Telegram's real nonnegative update IDs.
+                    update_id = -int(task[:15], 16) - 1
+                    db.execute("INSERT INTO telegram_origins VALUES(?,?,?,?,?)", (task, update_id, *telegram_scope))
                 if telegram_origin:
                     db.execute("INSERT INTO telegram_origins VALUES(?,?,?,?,?)", (task, *telegram_origin))
                     db.execute("DELETE FROM telegram_drafts WHERE user_id=? AND chat_id=? AND topic=?", scope)
