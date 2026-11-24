@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import tempfile
 import time
 import unittest
@@ -78,6 +80,90 @@ class TestEngine(unittest.TestCase):
         self.assertIn("Check the destination", view["summary"])
         with self.assertRaises(Conflict):
             self.engine.control(task, "retry")
+
+    def ops_task(self):
+        draft = base64.b64encode(b"# Draft report\n").decode()
+        task = self.engine.submit("Review the draft report", "live", {"report.md": draft})
+        with self.engine.store.tx() as db:
+            db.execute("INSERT INTO steps(task,id,capability,instruction,deps) VALUES(?,?,?,?,?)",
+                       (task, "report", "ops", "Review and publish", "[]"))
+        return task
+
+    def step(self, task):
+        with self.engine.store.tx(write=False) as db:
+            return db.execute("SELECT * FROM steps WHERE task=? AND id='report'", (task,)).fetchone()
+
+    def propose(self, task, tool, args):
+        self.engine.propose(task, self.step(task), self.engine.bots["ops"], {"tool": tool, "args": args})
+
+    def execute(self, task):
+        self.engine.execute(task, self.step(task), self.engine.bots["ops"])
+
+    def answer(self, task):
+        self.propose(task, "clarify", {"question": "Which draft should I use?"})
+        self.execute(task)
+        details = self.engine.task_view(task)
+        self.assertEqual(details["status"], "blocked")
+        self.engine.approval(details["approvals"][0]["id"], "approve", "Use report.md")
+        self.execute(task)
+
+    def test_repeated_clarification_reuses_answer_and_keeps_publication_gate(self):
+        task = self.ops_task()
+        self.answer(task)
+        for question in ("Should I use the report draft?", "Which report did you mean?"):
+            self.propose(task, "clarify", {"question": question})
+            self.execute(task)
+            view = self.engine.task_view(task)
+            self.assertEqual(view["status"], "in_progress")
+            self.assertEqual([gate["state"] for gate in view["approvals"]], ["consumed"])
+            observation = view["steps"][0]["observations"][-1]["result"]
+            self.assertEqual(observation["answer"], "Use report.md")
+            self.assertEqual(observation["status"], "already_answered")
+
+        self.propose(task, "publish", {"path": "attachments/report.md"})
+        self.execute(task)
+        view = self.engine.task_view(task)
+        self.assertEqual(view["status"], "needs_review")
+        pending = view["approvals"][-1]
+        self.assertEqual(pending["action"]["tool"], "publish")
+        self.assertNotIn("published/report/report.md", view["artifacts"])
+        self.engine.approval(pending["id"], "approve", "")
+        self.execute(task)
+        self.assertIn("published/report/report.md", self.engine.task_view(task)["artifacts"])
+
+    def test_restart_recovers_old_repeat_and_keeps_unanswered_question(self):
+        repeated, genuine = self.ops_task(), self.ops_task()
+        self.answer(repeated)
+        self.propose(repeated, "clarify", {"question": "Can you confirm the draft?"})
+        self.propose(genuine, "clarify", {"question": "Which file belongs in this report?"})
+        self.execute(genuine)
+        with self.engine.store.tx() as db:
+            action = db.execute("SELECT action FROM steps WHERE task=?", (repeated,)).fetchone()["action"]
+            db.execute("INSERT INTO approvals VALUES(?,?,?,?,?,'pending',NULL,?)",
+                       ("old", repeated, "report", hashlib.sha256(action.encode()).hexdigest(), action, time.time()))
+            db.execute("UPDATE steps SET state='blocked' WHERE task=?", (repeated,))
+            self.engine.refresh(db, repeated)
+        with patch.object(self.engine.tools, "sandbox_cleanup"), patch.object(self.engine, "run"):
+            self.engine.start()
+            self.addCleanup(self.engine.close)
+        current = self.engine.task_view(repeated)
+        self.assertEqual(current["steps"][0]["state"], "queued")
+        self.assertEqual([gate["state"] for gate in current["approvals"]], ["consumed", "void"])
+        self.assertEqual(self.engine.task_view(genuine)["approvals"][0]["state"], "pending")
+        self.assertEqual(self.engine.task_view(genuine)["status"], "blocked")
+        with self.assertRaises(Conflict):
+            self.engine.approval("old", "approve", "Yes")
+
+    def test_worker_can_ask_again_after_doing_work(self):
+        task = self.ops_task()
+        self.answer(task)
+        self.propose(task, "read", {"path": "attachments/report.md"})
+        self.execute(task)
+        self.propose(task, "clarify", {"question": "Who is the audience for this report?"})
+        self.execute(task)
+        current = self.engine.task_view(task)
+        self.assertEqual(current["status"], "blocked")
+        self.assertEqual([gate["state"] for gate in current["approvals"]], ["consumed", "pending"])
 
     def test_invalid_dag_is_rejected(self):
         plan = {"steps": [

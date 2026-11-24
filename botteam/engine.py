@@ -38,6 +38,14 @@ def decode(row, *names):
     return result
 
 
+def last_clarification(observations):
+    if observations and observations[-1]["tool"] == "clarify":
+        result = observations[-1]["result"]
+        if result.get("answer"):
+            return result
+    return None
+
+
 class Engine:
     def __init__(self, config, root):
         self.config = config
@@ -78,6 +86,18 @@ class Engine:
                     event(db, task, "step_recovered", step=name)
                     self.refresh(db, task)
             db.execute("UPDATE tasks SET planning=0, finishing=0 WHERE planning=1 OR finishing=1")
+            pending = db.execute(
+                "SELECT s.*,a.id AS approval_id FROM steps s JOIN approvals a ON "
+                "a.task=s.task AND a.step=s.id AND a.action=s.action JOIN tasks t ON t.id=s.task "
+                "WHERE s.state='blocked' AND a.state='pending' AND t.status NOT IN "
+                "('completed','failed','cancelled')"
+            ).fetchall()
+            for step in pending:
+                action = json.loads(step["action"])
+                if self.continue_after_clarification(db, step["task"], step, action):
+                    db.execute("UPDATE approvals SET state='void' WHERE id=?", (step["approval_id"],))
+                    event(db, step["task"], "approval_voided",
+                          {"approval": step["approval_id"], "reason": "Clarification already answered"}, step["id"])
         self.thread = threading.Thread(target=self.run, name="director")
         self.thread.start()
 
@@ -473,6 +493,8 @@ class Engine:
                 (task_id, profile["id"]))]
         observations = json.loads(row["observations"])
         allowed = self.allowed_tools(profile, row["capability"])
+        if last_clarification(observations):
+            allowed.discard("clarify")
         context = {
             "goal": task["goal"], "step": name, "instruction": row["instruction"],
             "review_of": row["review_of"], "review_feedback": row["feedback"],
@@ -565,6 +587,22 @@ class Engine:
             event(db, task, "tool_proposed", {"tool": name, "bot": profile["id"]}, step)
             self.refresh(db, task)
 
+    def continue_after_clarification(self, db, task, row, action):
+        if action["tool"] != "clarify":
+            return False
+        # Allow another question after the step has used the answer to make progress.
+        previous = last_clarification(json.loads(row["observations"]))
+        if previous is None:
+            return False
+        self.record_tool(db, task, row, action, {
+            **previous,
+            "status": "already_answered",
+            "guidance": "Continue the current work using the recorded answer. Use the actual gated tool "
+                        "when the action and its inputs are ready for approval."
+        })
+        event(db, task, "clarification_reused", step=row["id"])
+        return True
+
     def execute(self, task, row, profile):
         step = row["id"]
         action = json.loads(row["action"])
@@ -580,6 +618,8 @@ class Engine:
             approval = db.execute("SELECT * FROM approvals WHERE task=? AND step=? AND digest=?",
                                   (task, step, digest)).fetchone()
             if gate and approval is None:
+                if self.continue_after_clarification(db, task, row, action):
+                    return
                 approval_id = uuid.uuid4().hex
                 db.execute("INSERT INTO approvals VALUES(?,?,?,?,?,'pending',NULL,?)",
                            (approval_id, task, step, digest, encode(action), time.time()))
@@ -597,7 +637,9 @@ class Engine:
                     raise Conflict("Action lacks a current approval")
                 db.execute("UPDATE approvals SET state='consumed' WHERE id=?", (approval["id"],))
             if tool == "clarify":
-                self.record_tool(db, task, row, action, {"answer": approval["response"]})
+                self.record_tool(db, task, row, action, {
+                    "question": action["args"]["question"], "answer": approval["response"]
+                })
                 return
             if tool == "schedule":
                 args = action["args"]

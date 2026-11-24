@@ -21,7 +21,7 @@ CONTRACTS = {
     "integration": {"name": "configured integration", "payload": "literal JSON"},
     "pull_request": {"title": "string", "head": "existing branch", "base": "existing branch", "body": "string"},
     "schedule": {"goal": "future task goal", "interval_seconds": "integer >= 60"},
-    "clarify": {"question": "specific blocking question"}
+    "clarify": {"question": "specific missing task information needed to proceed"}
 }
 
 
@@ -51,9 +51,12 @@ class Model:
                          "id, capability, instruction, depends_on (array), and review_of (optional). Use a review "
                          "step for meaningful builds, with review_of set to its direct dependency. All downstream "
                          "consumers of reviewed work must depend on its reviewer. Use an ops step for external acts "
-                         "only when authorized by the goal. Use the writer when it adds value. If the goal needs "
-                         "human clarification, create a first step that asks a specific question via clarify; "
-                         "downstream workers will get that answer. Scope each step to one deliverable.",
+                         "only when authorized by the goal. If approval is requested before an action, plan the "
+                         "preparation first, then one ops step that calls the actual gated tool. The system requests "
+                         "approval when that tool is called. Do not add a separate approval-question step. "
+                         "Use the writer when it adds value. If missing task information prevents meaningful work, "
+                         "plan a step that asks for it via clarify before its dependents. Scope each step to one "
+                         "deliverable.",
                          {**context, "capabilities": capabilities})
 
     def worker(self, task, profile, context):
@@ -65,7 +68,12 @@ class Model:
                          "Use only listed tools. Insights from the last tool call are in observations. "
                          "Inspect failures and repair them where possible. Review feedback may require revising "
                          "earlier written artifacts. Report a failed verdict when review could not be completed. "
-                         "For genuine user ambiguity, call clarify with a specific question.", context)
+                         "Call clarify only to obtain missing task information that blocks the current step. "
+                         "Use the clarification answer in observations and continue the step. Combine related "
+                         "questions in one request. For approval of a gated action, finish preparation and call "
+                         "the actual tool when available; the system requests approval for its exact arguments. "
+                         "Do not use clarify for permission to run a tool or pause preparatory work solely because "
+                         "a later action requires approval.", context)
 
     def finish(self, task, context):
         if self.offline:
