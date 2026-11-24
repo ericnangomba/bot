@@ -165,6 +165,37 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(current["status"], "blocked")
         self.assertEqual([gate["state"] for gate in current["approvals"]], ["consumed", "pending"])
 
+    def test_invalid_live_plan_gets_one_feedback_attempt(self):
+        from unittest.mock import Mock
+        bad = {"steps": [{"id": "check", "capability": "review", "instruction": "Check", "depends_on": []}]}
+        good = {"steps": [{"id": "draft", "capability": "write", "instruction": "Write", "depends_on": []}]}
+        self.engine.model = Mock(offline=False)
+        self.engine.model.plan.side_effect = [bad, good]
+        task = self.engine.submit("Write welcome", "live", {})
+        with self.engine.store.tx(write=False) as db:
+            row = dict(self.engine.task_row(db, task))
+        self.engine.plan(row)
+        self.assertEqual(self.engine.task_view(task)["steps"], [])
+        self.assertNotEqual(self.engine.task_view(task)["status"], "failed")
+        self.engine.plan(row)
+        self.assertEqual(self.engine.task_view(task)["steps"][0]["id"], "draft")
+        self.assertIn("directly depend", self.engine.model.plan.call_args.args[1]["plan_feedback"])
+
+    def test_second_invalid_plan_fails_without_weakening_validator(self):
+        from unittest.mock import Mock
+        bad = {"steps": [{"id": "check", "capability": "review", "instruction": "Check", "depends_on": []}]}
+        self.engine.model = Mock(offline=False)
+        self.engine.model.plan.return_value = bad
+        task = self.engine.submit("Write welcome", "live", {})
+        with self.engine.store.tx(write=False) as db:
+            row = dict(self.engine.task_row(db, task))
+        self.engine.plan(row)
+        self.engine.plan(row)
+        view = self.engine.task_view(task)
+        self.assertEqual(view["status"], "failed")
+        self.assertEqual(view["steps"], [])
+        self.assertIn("directly depend", view["summary"])
+
     def test_invalid_dag_is_rejected(self):
         plan = {"steps": [
             {"id": "a", "capability": "build", "depends_on": ["b"], "instruction": "Build"},

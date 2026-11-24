@@ -48,7 +48,14 @@ class Model:
             return demo_plan()
         return self.call(task, self.director,
                          "You are the Director. Return JSON with steps, a DAG of up to 32 entries. Each entry has "
-                         "id, capability, instruction, depends_on (array), and review_of (optional). Use a review "
+                         "id, capability, instruction, depends_on (array), and review_of (REQUIRED for review capability, "
+                         "otherwise omit it). Use the smallest valid plan. For a simple writing request one write "
+                         "step is sufficient. Example: {\"steps\":[{\"id\":\"draft\",\"capability\":\"write\","
+                         "\"instruction\":\"Write the requested file\",\"depends_on\":[]}]}. "
+                         "For a review of draft use {\"id\":\"check\",\"capability\":\"review\","
+                         "\"instruction\":\"Check the draft\",\"depends_on\":[\"draft\"],\"review_of\":\"draft\"}. "
+                         "Use capability values from capabilities, not bot names. Never use empty/null review_of "
+                         "for a review. If plan_feedback is present, correct that validation error in a new plan. Use a review "
                          "step for meaningful builds, with review_of set to its direct dependency. All downstream "
                          "consumers of reviewed work must depend on its reviewer. Use an ops step for external acts "
                          "only when authorized by the goal. If approval is requested before an action, plan the "
