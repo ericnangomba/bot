@@ -61,7 +61,8 @@ class Model:
                          "only when authorized by the goal. If approval is requested before an action, plan the "
                          "preparation first, then one ops step that calls the actual gated tool. The system requests "
                          "approval when that tool is called. Do not add a separate approval-question step. "
-                         "Use the writer when it adds value. If missing task information prevents meaningful work, "
+                         "Use build to write and run code, and use write for prose deliverables. "
+                         "If missing task information prevents meaningful work, "
                          "plan a step that asks for it via clarify before its dependents. Scope each step to one "
                          "deliverable.",
                          {**context, "capabilities": capabilities})
@@ -73,7 +74,10 @@ class Model:
                          '{"tool":"name","args":{...}}. To finish, return {"summary":"...",'
                          '"artifacts":["workspace-relative paths"],"verdict":"pass or fail for review only"}. '
                          "Use only listed tools. Insights from the last tool call are in observations. "
-                         "Inspect failures and repair them where possible. Review feedback may require revising "
+                         "Write requested files through a workspace tool and list their paths in artifacts. "
+                         "If a prerequisite artifact is missing, recreate it from the available inputs when that "
+                         "fits the current step. Otherwise report what is missing. Inspect failures and repair them "
+                         "where possible. Review feedback may require revising "
                          "earlier written artifacts. Report a failed verdict when review could not be completed. "
                          "Call clarify only to obtain missing task information that blocks the current step. "
                          "Use the clarification answer in observations and continue the step. Combine related "

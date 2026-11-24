@@ -5,7 +5,7 @@ import os
 import threading
 import time
 
-from .actions import Transient, request
+from .actions import ProviderRequestError, Transient, request
 from .store import encode
 
 
@@ -125,8 +125,17 @@ class Router:
                 continue
             try:
                 with self.slot(profile["id"], name, provider, model, inference) as keep_alive:
-                    self.reserve(task, model, alias, name, provider["rpm"], estimated_input, output)
-                    return self.invoke(provider, model, messages, inference, context, output, key, keep_alive)
+                    reservation = task, model, alias, name, provider["rpm"], estimated_input, output
+                    self.reserve(*reservation)
+                    try:
+                        return self.invoke(provider, model, messages, inference, context, output, key, keep_alive)
+                    except ProviderRequestError as exc:
+                        if (exc.status != 400 or not exc.json_mode_failure or
+                                provider["kind"] == "ollama" or not provider.get("json_mode", True)):
+                            raise
+                        self.reserve(*reservation)
+                        return self.invoke(provider, model, messages, inference, context, output, key, keep_alive,
+                                           use_json_mode=False)
             except RateLimited as exc:
                 busy.append(exc.delay)
                 reasons.append(f"{alias}: busy or rate limited")
@@ -139,8 +148,10 @@ class Router:
                 with self.lock:
                     self.cooldown[name] = time.monotonic() + duration
                 reasons.append(f"{alias}: {exc}")
+            except ProviderRequestError as exc:
+                reasons.append(f"{alias}: {exc}")
             except (ValueError, KeyError, IndexError, TypeError) as exc:
-                detail = str(exc) if type(exc) is ValueError and str(exc).startswith(("HTTP ", "Local residency")) else ""
+                detail = str(exc) if type(exc) is ValueError and str(exc).startswith("Local residency") else ""
                 reasons.append(f"{alias}: {detail or 'invalid or unavailable response'}")
         if retriable:
             raise Transient("No model route succeeded (" + "; ".join(reasons) + ")")
@@ -150,7 +161,7 @@ class Router:
             raise BudgetExceeded("Task budget prevents the remaining model routes")
         raise ValueError("No usable model route (" + "; ".join(reasons) + ")")
 
-    def invoke(self, provider, model, messages, inference, context, output, key, keep_alive):
+    def invoke(self, provider, model, messages, inference, context, output, key, keep_alive, *, use_json_mode=True):
         kind = provider["kind"]
         timeout = provider.get("timeout_seconds", self.policy["model_timeout_seconds"])
         if kind == "ollama":
@@ -162,7 +173,7 @@ class Router:
             url = self.url(provider, "chat/completions")
             payload = {"model": model["name"], "messages": messages, "temperature": inference["temperature"],
                        provider.get("output_parameter", "max_tokens"): output}
-            if provider.get("json_mode", True):
+            if use_json_mode and provider.get("json_mode", True):
                 payload["response_format"] = {"type": "json_object"}
         _, body = request(url, timeout, self.headers(key), payload, local=kind != "openai_compatible")
         reply = json.loads(body)

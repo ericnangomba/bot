@@ -26,6 +26,36 @@ class Transient(Exception):
     """A retry may resolve the failure."""
 
 
+class ProviderRequestError(ValueError):
+    JSON_ERRORS = {
+        "json_validate_failed", "json_schema_validation_failed",
+        "response_format_unsupported", "unsupported_response_format",
+    }
+    KNOWN_CODES = JSON_ERRORS | {
+        "context_length_exceeded", "model_decommissioned", "model_not_found",
+        "invalid_model", "invalid_request_error",
+    }
+
+    def __init__(self, status, error):
+        self.status = status
+        code = error.get("code")
+        self.code = code if isinstance(code, str) and code in self.KNOWN_CODES else None
+        self.json_mode_failure = self.code in self.JSON_ERRORS or error.get("param") == "response_format"
+        detail = self.code or ("response_format" if self.json_mode_failure else None)
+        super().__init__(f"HTTP {status}" + (f" ({detail})" if detail else ""))
+
+    @classmethod
+    def from_http_error(cls, exc):
+        try:
+            with exc:
+                payload = json.loads(exc.read(16_384))
+            error = payload.get("error") if isinstance(payload, dict) else None
+        except (ValueError, OSError):
+            error = None
+        # Provider messages and failed generations may echo task data. Keep only allowlisted metadata.
+        return cls(exc.code, error if isinstance(error, dict) else {})
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -56,7 +86,7 @@ def request(url, timeout, headers=None, payload=None, local=False):
     except HTTPError as exc:
         if exc.code in {408, 425, 429} or exc.code >= 500:
             raise Transient(f"HTTP {exc.code}") from exc
-        raise ValueError(f"HTTP {exc.code}") from exc
+        raise ProviderRequestError.from_http_error(exc) from exc
     except (URLError, TimeoutError, OSError) as exc:
         raise Transient(f"HTTP transport failure ({type(exc).__name__})") from exc
 

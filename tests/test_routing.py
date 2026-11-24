@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import tempfile
@@ -6,8 +7,9 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
-from botteam.actions import Transient
+from botteam.actions import ProviderRequestError, Transient, request
 from botteam.engine import Engine
 from botteam.routing import BudgetExceeded, RateLimited, Router
 from botteam.settings import read_config
@@ -80,6 +82,58 @@ class TestRouting(unittest.TestCase):
         self.assertEqual([path for path, _ in requests], ["/api/chat", "/v1/chat/completions"])
         self.assertEqual(requests[0][1]["format"], "json")
         self.assertEqual(requests[1][1]["response_format"], {"type": "json_object"})
+
+    def test_json_format_rejection_retries_once_without_response_format(self):
+        reserved = []
+        router = Router(self.config, lambda *args: reserved.append(args))
+        profile = {**self.profile, "route": ["groq_free"]}
+        failure = ProviderRequestError(400, {"code": "json_validate_failed"})
+        with patch.dict(os.environ, {"GROQ_API_KEY": "fixture"}), patch(
+                "botteam.routing.request", side_effect=[failure, hosted_reply({"ok": True})]) as call:
+            self.assertEqual(router.call("task", profile, MESSAGES), {"ok": True})
+        self.assertEqual([item[2] for item in reserved], ["groq_free", "groq_free"])
+        first, second = [record.args[3] for record in call.call_args_list]
+        self.assertEqual(first["response_format"], {"type": "json_object"})
+        self.assertNotIn("response_format", second)
+        self.assertEqual({key: val for key, val in first.items() if key != "response_format"}, second)
+
+    def test_json_format_retry_obeys_remaining_budget(self):
+        reserved = []
+
+        def reserve(*args):
+            if reserved:
+                raise BudgetExceeded("Budget exhausted")
+            reserved.append(args)
+
+        router = Router(self.config, reserve)
+        profile = {**self.profile, "route": ["groq_free"]}
+        failure = ProviderRequestError(400, {"param": "response_format"})
+        with patch.dict(os.environ, {"GROQ_API_KEY": "fixture"}), patch(
+                "botteam.routing.request", side_effect=failure) as call:
+            with self.assertRaises(BudgetExceeded):
+                router.call("task", profile, MESSAGES)
+        self.assertEqual(call.call_count, 1)
+
+    def test_other_400_preserves_safe_reason_without_json_format_retry(self):
+        router = Router(self.config, lambda *args: None)
+        profile = {**self.profile, "route": ["groq_free"]}
+        failure = ProviderRequestError(400, {"code": "context_length_exceeded"})
+        with patch.dict(os.environ, {"GROQ_API_KEY": "fixture"}), patch(
+                "botteam.routing.request", side_effect=failure) as call:
+            with self.assertRaisesRegex(ValueError, r"HTTP 400 \(context_length_exceeded\)"):
+                router.call("task", profile, MESSAGES)
+        self.assertEqual(call.call_count, 1)
+
+    def test_http_error_keeps_only_allowlisted_metadata(self):
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        response = {"error": {"code": "json_validate_failed", "message": "private prompt",
+                              "failed_generation": "private output", "param": "response_format"}}
+        error = HTTPError(url, 400, "Bad Request", {}, io.BytesIO(json.dumps(response).encode()))
+        with patch("botteam.actions.HTTP.open", side_effect=error):
+            with self.assertRaises(ProviderRequestError) as raised:
+                request(url, 1, payload={})
+        self.assertTrue(raised.exception.json_mode_failure)
+        self.assertEqual(str(raised.exception), "HTTP 400 (json_validate_failed)")
 
     def test_paid_route_does_not_call_provider_at_zero_budget(self):
         profile = {**self.profile, "route": ["openai_mini", "local_general"]}
