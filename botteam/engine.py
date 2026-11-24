@@ -39,10 +39,12 @@ def decode(row, *names):
 
 
 def last_clarification(observations):
-    if observations and observations[-1]["tool"] == "clarify":
-        result = observations[-1]["result"]
-        if result.get("answer"):
-            return result
+    for observation in reversed(observations):
+        if observation["tool"] == "completion_validation":
+            continue
+        if observation["tool"] == "clarify" and observation["result"].get("answer"):
+            return observation["result"]
+        break
     return None
 
 
@@ -697,9 +699,8 @@ class Engine:
         artifacts = reply.get("artifacts", [])
         if not isinstance(artifacts, list) or len(artifacts) > 12:
             raise ValueError("Invalid artifact list")
-        for artifact in artifacts:
-            if not path_under(self.projects / task, artifact).is_file():
-                raise ValueError("Worker named an artifact that does not exist")
+        missing = [artifact for artifact in artifacts
+                   if not path_under(self.projects / task, artifact).is_file()]
         name = row["id"]
         result = {"summary": summary, "artifacts": artifacts}
         review = row["review_of"] is not None
@@ -710,6 +711,25 @@ class Engine:
         with self.store.tx() as db:
             if self.task_row(db, task)["status"] in TERMINAL:
                 db.execute("UPDATE steps SET state='queued' WHERE task=? AND id=?", (task, name))
+                return
+            if missing:
+                observations = json.loads(row["observations"])
+                error = "Worker named a missing artifact: " + missing[0]
+                if (row["turns"] + 1 >= self.policy["max_turns"] or
+                        (observations and observations[-1]["tool"] == "completion_validation")):
+                    raise ValueError(error)
+                feedback = {
+                    "error": error,
+                    "missing": missing,
+                    "guidance": "If the step calls for a file, create it with an available workspace tool. "
+                                "Use the workspace-relative artifact path returned by the tool. "
+                                "List only files that exist when you finish.",
+                }
+                observations.append({"tool": "completion_validation", "result": feedback})
+                db.execute("UPDATE steps SET state='queued',observations=?,turns=turns+1,attempts=0,ready=0 "
+                           "WHERE task=? AND id=?", (encode(observations), task, name))
+                event(db, task, "completion_rejected", {"missing": missing}, name)
+                self.refresh(db, task)
                 return
             if result.get("verdict") == "fail":
                 self.log_run(db, task, name, profile["id"], "rejected", result)

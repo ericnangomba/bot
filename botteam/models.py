@@ -74,7 +74,9 @@ class Model:
                          '{"tool":"name","args":{...}}. To finish, return {"summary":"...",'
                          '"artifacts":["workspace-relative paths"],"verdict":"pass or fail for review only"}. '
                          "Use only listed tools. Insights from the last tool call are in observations. "
-                         "Write requested files through a workspace tool and list their paths in artifacts. "
+                         "Write requested files through a workspace tool and list the workspace-relative paths "
+                         "returned by that tool in artifacts. Resolve any completion_validation observation "
+                         "before reporting completion again. "
                          "If a prerequisite artifact is missing, recreate it from the available inputs when that "
                          "fits the current step. Otherwise report what is missing. Inspect failures and repair them "
                          "where possible. Review feedback may require revising "

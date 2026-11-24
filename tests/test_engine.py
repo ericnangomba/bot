@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from botteam.actions import Transient
 from botteam.engine import Conflict, Engine
@@ -195,6 +195,57 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(view["status"], "failed")
         self.assertEqual(view["steps"], [])
         self.assertIn("directly depend", view["summary"])
+
+    def artifact_step(self):
+        task = self.engine.submit("Create greeting.md", "live", {})
+        with self.engine.store.tx() as db:
+            db.execute("INSERT INTO steps(task,id,capability,instruction,deps) VALUES(?,?,?,?,?)",
+                       (task, "report", "write", "Create greeting.md", "[]"))
+        return task
+
+    def worker_turn(self, task):
+        with self.engine.store.tx(write=False) as db:
+            row = dict(self.engine.task_row(db, task))
+        self.engine.turn(row, self.step(task), self.engine.bots["writer"])
+
+    def test_missing_artifact_is_returned_to_worker_and_written(self):
+        task = self.artifact_step()
+        path = "steps/report/greeting.md"
+        completion = {"summary": "Wrote the greeting", "artifacts": [path]}
+        self.engine.model = Mock(offline=False)
+        self.engine.model.worker.side_effect = [
+            completion, {"tool": "write", "args": {"path": "greeting.md", "content": "Hello!\n"}}, completion
+        ]
+
+        self.worker_turn(task)
+        retry = self.engine.task_view(task)
+        self.assertEqual(retry["steps"][0]["state"], "queued")
+        self.assertEqual(retry["steps"][0]["turns"], 1)
+        self.assertEqual(retry["artifacts"], [])
+
+        self.worker_turn(task)
+        feedback = self.engine.model.worker.call_args.args[2]["observations"][-1]
+        self.assertEqual(feedback["tool"], "completion_validation")
+        self.assertEqual(feedback["result"]["missing"], [path])
+        self.worker_turn(task)  # Execute the requested write.
+        self.worker_turn(task)  # Submit the grounded completion.
+
+        view = self.engine.task_view(task)
+        self.assertEqual(view["steps"][0]["state"], "completed")
+        self.assertEqual(view["steps"][0]["result"]["artifacts"], [path])
+        self.assertEqual((self.engine.projects / task / path).read_text(), "Hello!\n")
+
+    def test_unchanged_missing_artifact_fails_after_one_correction(self):
+        task = self.artifact_step()
+        self.engine.model = Mock(offline=False)
+        self.engine.model.worker.return_value = {"summary": "Wrote it", "artifacts": ["greeting.md"]}
+        self.worker_turn(task)
+        self.worker_turn(task)
+        view = self.engine.task_view(task)
+        self.assertEqual(view["status"], "failed")
+        self.assertEqual(view["steps"][0]["turns"], 1)
+        self.assertIn("missing artifact: greeting.md", view["summary"])
+        self.assertEqual(view["artifacts"], [])
 
     def test_invalid_dag_is_rejected(self):
         plan = {"steps": [
