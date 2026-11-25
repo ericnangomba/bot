@@ -40,15 +40,20 @@ class ProviderRequestError(ValueError):
         self.status = status
         code = error.get("code")
         self.code = code if isinstance(code, str) and code in self.KNOWN_CODES else None
+        self.generic_request_error = error.get("type") == "invalid_request_error"
         self.json_mode_failure = self.code in self.JSON_ERRORS or error.get("param") == "response_format"
-        detail = self.code or ("response_format" if self.json_mode_failure else None)
+        detail = self.code
+        if detail is None and self.json_mode_failure:
+            detail = "response_format"
+        elif detail is None and self.generic_request_error:
+            detail = "invalid_request_error"
         super().__init__(f"HTTP {status}" + (f" ({detail})" if detail else ""))
 
     @classmethod
     def from_http_error(cls, exc):
         try:
             with exc:
-                payload = json.loads(exc.read(16_384))
+                payload = json.loads(exc.read(MAX_REPLY))
             error = payload.get("error") if isinstance(payload, dict) else None
         except (ValueError, OSError):
             error = None

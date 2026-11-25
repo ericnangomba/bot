@@ -1,9 +1,11 @@
 import collections
 import contextlib
+import hashlib
 import json
 import os
 import threading
 import time
+from urllib.parse import urlsplit
 
 from .actions import ProviderRequestError, Transient, request
 from .store import encode
@@ -30,6 +32,7 @@ class Router:
         self.provider_load = collections.Counter()
         self.role_load = collections.Counter()
         self.cooldown = {}
+        self.pending_plain_json = collections.OrderedDict()
         self.ollama_residents = {}
         self.static_residents = len({
             model["provider"] for model in self.models.values()
@@ -102,7 +105,9 @@ class Router:
         return {"Authorization": f"Bearer {key}"} if key else {}
 
     def call(self, task, profile, messages):
-        estimated_input = len(encode(messages).encode()) + 128
+        request_bytes = encode(messages).encode()
+        estimated_input = len(request_bytes) + 128
+        request_hash = hashlib.sha256(request_bytes).digest()
         if estimated_input > self.policy["max_input_tokens"]:
             raise ValueError("Prompt exceeds the configured input ceiling")
         inference = {**self.defaults, **profile.get("inference", {})}
@@ -126,16 +131,30 @@ class Router:
             try:
                 with self.slot(profile["id"], name, provider, model, inference) as keep_alive:
                     reservation = task, model, alias, name, provider["rpm"], estimated_input, output
+                    memo = (task, profile["id"], alias, request_hash)
+                    with self.lock:
+                        needs_plain = memo in self.pending_plain_json
                     self.reserve(*reservation)
                     try:
-                        return self.invoke(provider, model, messages, inference, context, output, key, keep_alive)
+                        result = self.invoke(provider, model, messages, inference, context, output, key, keep_alive,
+                                             use_json_mode=not needs_plain)
                     except ProviderRequestError as exc:
-                        if (exc.status != 400 or not exc.json_mode_failure or
+                        groq = urlsplit(provider["base_url"]).hostname == "api.groq.com"
+                        generic_groq = groq and exc.code in (None, "invalid_request_error")
+                        if (needs_plain or exc.status != 400 or not (exc.json_mode_failure or generic_groq) or
                                 provider["kind"] == "ollama" or not provider.get("json_mode", True)):
                             raise
+                        # Keep the fallback when the next reservation must wait for the RPM window.
+                        with self.lock:
+                            self.pending_plain_json[memo] = None
+                            if len(self.pending_plain_json) > 256:
+                                self.pending_plain_json.popitem(last=False)
                         self.reserve(*reservation)
-                        return self.invoke(provider, model, messages, inference, context, output, key, keep_alive,
-                                           use_json_mode=False)
+                        result = self.invoke(provider, model, messages, inference, context, output, key, keep_alive,
+                                             use_json_mode=False)
+                    with self.lock:
+                        self.pending_plain_json.pop(memo, None)
+                    return result
             except RateLimited as exc:
                 busy.append(exc.delay)
                 reasons.append(f"{alias}: busy or rate limited")

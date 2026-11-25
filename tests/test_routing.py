@@ -114,6 +114,31 @@ class TestRouting(unittest.TestCase):
                 router.call("task", profile, MESSAGES)
         self.assertEqual(call.call_count, 1)
 
+    def test_generic_groq_400_falls_back_after_the_rate_window(self):
+        router = Router(self.config, lambda *args: None)
+        profile = {**self.profile, "route": ["groq_free"]}
+        failure = ProviderRequestError(400, {"type": "invalid_request_error"})
+        with patch.dict(os.environ, {"GROQ_API_KEY": "fixture"}), patch.object(
+                router, "reserve", side_effect=[None, RateLimited(60), None]) as reserved, patch(
+                "botteam.routing.request", side_effect=[failure, hosted_reply({"ok": True})]) as call:
+            with self.assertRaises(RateLimited):
+                router.call("task", profile, MESSAGES)
+            self.assertEqual(router.call("task", profile, MESSAGES), {"ok": True})
+        self.assertEqual(reserved.call_count, 3)
+        first, second = [record.args[3] for record in call.call_args_list]
+        self.assertIn("response_format", first)
+        self.assertNotIn("response_format", second)
+
+    def test_generic_400_on_another_provider_does_not_retry_without_format(self):
+        router = Router(self.config, lambda *args: None)
+        profile = {**self.profile, "route": ["gemini_free"]}
+        failure = ProviderRequestError(400, {})
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "fixture"}), patch(
+                "botteam.routing.request", side_effect=failure) as call:
+            with self.assertRaisesRegex(ValueError, "gemini_free: HTTP 400"):
+                router.call("task", profile, MESSAGES)
+        self.assertEqual(call.call_count, 1)
+
     def test_other_400_preserves_safe_reason_without_json_format_retry(self):
         router = Router(self.config, lambda *args: None)
         profile = {**self.profile, "route": ["groq_free"]}
@@ -127,7 +152,7 @@ class TestRouting(unittest.TestCase):
     def test_http_error_keeps_only_allowlisted_metadata(self):
         url = "https://api.groq.com/openai/v1/chat/completions"
         response = {"error": {"code": "json_validate_failed", "message": "private prompt",
-                              "failed_generation": "private output", "param": "response_format"}}
+                              "failed_generation": "private output" * 2000, "param": "response_format"}}
         error = HTTPError(url, 400, "Bad Request", {}, io.BytesIO(json.dumps(response).encode()))
         with patch("botteam.actions.HTTP.open", side_effect=error):
             with self.assertRaises(ProviderRequestError) as raised:
