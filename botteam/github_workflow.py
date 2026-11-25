@@ -14,6 +14,7 @@ from .actions import ProviderRequestError, atomic_write, path_under, read_bytes,
 from .store import encode
 
 MODE = "github_issue"
+DIGEST_MODE = "github_digest"
 MANIFEST = "steps/checkout/manifest.json"
 ISSUE = "steps/checkout/issue.md"
 DIFF = "steps/review/proposed.diff"
@@ -140,6 +141,38 @@ class GitHubWorkflow:
             payload,
         )
         return json.loads(body)
+
+    def digest_preflight(self):
+        if (not isinstance(self.repo, str) or
+                not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_][A-Za-z0-9_.-]*", self.repo)
+                or not os.environ.get("BOTTEAM_GITHUB_TOKEN")):
+            raise ValueError("The daily digest needs a configured GitHub repository and token")
+
+    def issue_digest(self):
+        self.digest_preflight()
+        issues = []
+        # The repository issues endpoint includes PRs. Scan a bounded number of recent results.
+        for page in range(1, 5):
+            rows = self.get("issues?" + urlencode({
+                "state": "open", "sort": "updated", "direction": "desc", "per_page": 5, "page": page,
+            }))
+            if not isinstance(rows, list):
+                raise ValueError("GitHub did not return an issue list")
+            issues.extend(item for item in rows if "pull_request" not in item)
+            if len(issues) >= 10 or len(rows) < 5:
+                break
+        url = f"https://github.com/{self.repo}/issues"
+        lines = [f"Daily GitHub digest · {self.repo}", ""]
+        if not issues:
+            lines.append("No open issues in the recent results." if len(rows) == 5 else "No open issues.")
+        for issue in issues[:10]:
+            number = issue["number"]
+            if type(number) is not int or number < 1:
+                raise ValueError("GitHub returned an invalid issue number")
+            title = " ".join(issue["title"].split())[:140]
+            lines.append(f"#{number} {title}\n{url}/{number}")
+        lines.extend(("", f"All open issues: {url}?q=is%3Aissue+is%3Aopen"))
+        return "\n".join(lines)
 
     def branch_sha(self):
         return sha(self.get("git/ref/heads/" + quote(self.recipe["base"], safe="/"))["object"]["sha"])

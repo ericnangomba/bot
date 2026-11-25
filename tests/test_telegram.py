@@ -1,7 +1,9 @@
 import json
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 from botteam.engine import Engine
 from botteam.settings import read_config
@@ -102,6 +104,44 @@ class TestTelegram(unittest.TestCase):
         self.assertEqual(payload["message_thread_id"], 7)
         self.assertEqual(upload, ("long-report.md", b"x" * 3501))
         self.assertEqual(self.gateway.lookup(Scope(123, -100123, 90)), [])
+
+    def test_daily_digest_is_private_and_resumes_after_restart(self):
+        config = self.engine.config
+        config["policy"]["github_repo"] = "example/project"
+        self.engine.github.repo = "example/project"
+        with patch.dict("os.environ", {"BOTTEAM_GITHUB_TOKEN": "fixture"}):
+            self.send(1, 999, text="/digest on")
+            self.send(2, 123, chat={"id": -100123, "is_forum": True}, text="/digest on")
+            with self.engine.store.tx(write=False) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM schedules").fetchone()[0], 0)
+            self.send(3, 123, text="/digest on")
+            self.send(3, 123, text="/digest on")
+            self.engine = Engine(config, self.data.name)
+            self.gateway = Telegram(self.engine, self.client, [123, 456])
+            self.engine.fire_schedules()
+            self.engine.fire_schedules()
+            rows = self.gateway.lookup(Scope(123, 123))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(self.gateway.lookup(Scope(456, 456)), [])
+            issues = [{"number": 1, "title": "Open issue"},
+                      {"number": 2, "title": "A pull request", "pull_request": {}}]
+            with patch.object(self.engine.github, "get", return_value=issues) as github, patch.object(
+                    self.engine.model, "plan", side_effect=AssertionError("Digest used the model")):
+                handler, args, _ = self.engine.claim(Counter())
+                handler(*args)
+            github.assert_called_once()
+            self.assertIn("state=open", github.call_args.args[0])
+            self.gateway.deliver_events()
+            report = self.client.messages[-1][1]
+            self.assertEqual(report["chat_id"], 123)
+            self.assertIn("#1 Open issue", report["text"])
+            self.assertNotIn("A pull request", report["text"])
+            self.assertEqual(self.engine.task_view(rows[0]["id"])["approvals"], [])
+            self.send(4, 123, text="/digest off")
+            with self.engine.store.tx() as db:
+                db.execute("UPDATE schedules SET next_at=0")
+            self.engine.fire_schedules()
+            self.assertEqual(len(self.gateway.lookup(Scope(123, 123))), 1)
 
 
 if __name__ == "__main__":

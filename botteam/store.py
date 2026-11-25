@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS schedules (
     id TEXT PRIMARY KEY, goal TEXT NOT NULL, mode TEXT NOT NULL,
     interval_seconds INTEGER NOT NULL, next_at REAL NOT NULL, enabled INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS telegram_issue_digests (
+    user_id INTEGER PRIMARY KEY,
+    schedule TEXT NOT NULL UNIQUE REFERENCES schedules(id)
+);
 """
 
 

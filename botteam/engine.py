@@ -11,7 +11,7 @@ import time
 import uuid
 
 from .actions import Toolbox, Transient, bind_action, path_under, save_attachments, text_arg
-from .github_workflow import GitHubWorkflow, MODE as GITHUB_MODE, TOOLS as GITHUB_TOOLS, TOOLS_BY_STEP, issue_goal
+from .github_workflow import DIGEST_MODE, GitHubWorkflow, MODE as GITHUB_MODE, TOOLS as GITHUB_TOOLS, TOOLS_BY_STEP, issue_goal
 from .models import CONTRACTS, Model
 from .routing import BudgetExceeded, RateLimited
 from .settings import EFFECTS, GATED, validate_plan
@@ -200,13 +200,42 @@ class Engine:
     def fire_schedules(self):
         now = time.time()
         with self.store.tx() as db:
-            schedules = db.execute("SELECT * FROM schedules WHERE enabled=1 AND next_at<=? LIMIT 20", (now,)).fetchall()
+            schedules = db.execute(
+                "SELECT s.*,d.user_id FROM schedules s LEFT JOIN telegram_issue_digests d ON d.schedule=s.id "
+                "WHERE s.enabled=1 AND s.next_at<=? LIMIT 20", (now,),
+            ).fetchall()
             for row in schedules:
                 task = uuid.uuid4().hex
                 save_attachments(self.projects / task, {})
                 self.insert_task(db, row["goal"], row["mode"], task)
+                if row["user_id"] is not None:
+                    user = row["user_id"]
+                    update_id = -int(task[:15], 16) - 1
+                    db.execute("INSERT INTO telegram_origins VALUES(?,?,?,?,0)", (task, update_id, user, user))
                 event(db, task, "schedule_fired", {"schedule": row["id"]})
                 db.execute("UPDATE schedules SET next_at=? WHERE id=?", (now + row["interval_seconds"], row["id"]))
+
+    def telegram_digest(self, user, command):
+        if command == "on":
+            self.github.digest_preflight()
+        with self.store.tx() as db:
+            current = db.execute(
+                "SELECT s.id,s.enabled FROM schedules s JOIN telegram_issue_digests d ON d.schedule=s.id "
+                "WHERE d.user_id=?", (user,),
+            ).fetchone()
+            if command == "on" and current is None:
+                schedule = uuid.uuid4().hex
+                db.execute("INSERT INTO schedules VALUES(?,?,?,?,?,1)",
+                           (schedule, "Daily GitHub issue digest", DIGEST_MODE, 86_400, time.time()))
+                db.execute("INSERT INTO telegram_issue_digests VALUES(?,?)", (user, schedule))
+                return "Daily GitHub digest is on. The first one is queued now."
+            if command == "on" and not current["enabled"]:
+                db.execute("UPDATE schedules SET enabled=1,next_at=? WHERE id=?", (time.time(), current["id"]))
+                return "Daily GitHub digest is on. The first one is queued now."
+            if command == "off" and current:
+                db.execute("UPDATE schedules SET enabled=0 WHERE id=?", (current["id"],))
+            enabled = command != "off" and current is not None and current["enabled"]
+            return f"Daily GitHub digest is {'on' if enabled else 'off'}."
 
     def reserve(self, task, profile, alias, provider, provider_rpm, input_tokens, output_tokens):
         tokens = input_tokens + output_tokens
@@ -419,6 +448,14 @@ class Engine:
 
     def plan(self, task):
         task_id = task["id"]
+        if task["mode"] == DIGEST_MODE:
+            try:
+                summary = self.github.issue_digest()
+            except Exception as exc:
+                self.director_error(task_id, "planning", exc)
+                return
+            self.record_director_result(task_id, "planning", {"summary": summary, "passed": True})
+            return
         try:
             context = {"goal": task["goal"], "mode": "demo" if self.model.offline else task["mode"],
                        "attachments": self.files(task_id)}
@@ -475,8 +512,11 @@ class Engine:
         except Exception as exc:
             self.director_error(task_id, "finishing", exc)
             return
+        self.record_director_result(task_id, "finishing", result)
+
+    def record_director_result(self, task_id, phase, result):
         with self.store.tx() as db:
-            db.execute("UPDATE tasks SET finishing=0 WHERE id=?", (task_id,))
+            db.execute(f"UPDATE tasks SET {phase}=0 WHERE id=?", (task_id,))
             if self.task_row(db, task_id)["status"] in TERMINAL:
                 return
             if not result["passed"]:

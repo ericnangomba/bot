@@ -407,13 +407,20 @@ class Telegram:
         if command in {"/start", "/help"}:
             self.send(scope, "Send a goal as text or a voice note. Send a file with a caption, or stage files "
                       "and send the goal next.\n\n"
-                      "/issue <number> · /status [id] · /tasks · /bots · /logs [id]\n"
+                      "/issue <number> · /digest on|off|status · /status [id] · /tasks · /bots · /logs [id]\n"
                       "/pause [id] · /resume [id] · /cancel <id> · /retry <id>\n"
                       "/answer <approval_id> <answer> · /artifact <id> <path> · /clearfiles")
         elif command == "/issue":
             task = self.engine.submit(remainder, "github_issue", {},
                                       telegram_origin=(update_id, *scope.keys()) if update_id is not None else None)
             self.send(scope, f"Queued GitHub issue job {task[:8]}. Use /status {task[:8]} to follow it.")
+        elif command == "/digest":
+            if scope.chat != scope.user or scope.topic:
+                raise ValueError("Use /digest in your private chat with Bot Team")
+            action = remainder.lower() or "status"
+            if action not in {"on", "off", "status"}:
+                raise ValueError("Use /digest on, /digest off, or /digest status")
+            self.send(scope, self.engine.telegram_digest(scope.user, action))
         elif command == "/bots":
             overview = ["Director — planning, scheduling, and final review"]
             overview.extend(f"{bot['id']} — {', '.join(bot['capabilities'])} · {' → '.join(bot['route'])}"

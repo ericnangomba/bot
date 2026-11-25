@@ -106,6 +106,12 @@ binds the branch, base commit, patch, and evidence. If the base branch moves bef
 draft, submit the issue again so the new base can be tested and reviewed. The workflow concludes once
 GitHub confirms the draft, and a person can review it and merge it through the repository's normal process.
 
+### Daily Telegram issue digest
+
+Send `/digest on` in your authorized private chat. Bot Team queues the first digest immediately and repeats it every 24 hours. Use `/digest status` to check enrollment and `/digest off` to stop future runs. Enrollment and the next run are stored in SQLite, so the schedule resumes after a restart.
+
+The report lists up to ten recently updated open issues from `policy.github_repo`. It uses the existing `BOTTEAM_GITHUB_TOKEN` with Issues read access. It reads GitHub directly, skips pull requests, and sends the report to the private chat that enabled it. There are no model calls or per-report approvals.
+
 ## Configure models and bots
 
 `bots.yaml` has four layers.
