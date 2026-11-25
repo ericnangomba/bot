@@ -58,6 +58,44 @@ Private chats are the default. For optional forum topics, set `TELEGRAM_FORUM_CH
 
 The gateway long-polls Telegram, persists incoming update and outgoing event cursors, and requires allowlist and task-ownership checks for messages and buttons. Submissions use Telegram update IDs for deduplication. A crash between sending a message and saving its cursor can repeat a notification. Use one long-polling process per bot token, with any existing webhook removed. `health` reports when polling has recently succeeded.
 
+## Turn a GitHub issue into a draft PR
+
+This workflow takes a real issue from one configured repository, prepares a tested patch, and hands the
+draft PR link back to the dashboard and Telegram. The operator approves the reviewed patch before any
+branch or pull request is created. Once approved, GitHub transport retries reuse the same branch and
+recognize an existing matching draft.
+
+1. In `bots.yaml`, set the existing `policy.github_repo` value to `owner/repo`.
+2. Add a top-level `github_workflow` recipe for the parts of the repository Bot Team may work on.
+3. Set `BOTTEAM_GITHUB_TOKEN` in the service's secret file. Prefer a fine-grained token limited to that
+   repository, with Issues read, Contents read/write, and Pull requests read/write. Use live models and
+   build an image with the required runtime and dependencies already installed.
+4. Restart Bot Team and send `/issue 42` in your authorized Telegram chat, for example. From the CLI
+   use `python -m botteam submit 42 --github-issue`. The authenticated API can submit
+   `{"goal":"42","mode":"github_issue"}` to `POST /tasks`.
+
+Example recipe for a small Python module, with names to replace for your repository:
+
+```yaml
+github_workflow:
+  base: main
+  paths: [app.py, tests/check_app.py]
+  editable_paths: [app.py]
+  test_paths: [tests/check_app.py]
+  test_argv: [python, -m, unittest, discover, -s, tests, -p, check_app.py]
+```
+
+The recipe checks out a pinned snapshot of the exact listed text files. It supports up to 40 paths and
+50 KB per source file. Editable paths are existing files included in the snapshot. Keep the regression
+tests and their fixtures outside editable paths. The configured test command always runs in the
+network-disabled Docker sandbox. The builder can fix test failures within its configured repair limit.
+Add every import or fixture required by the test command to the snapshot.
+
+At the draft approval, inspect `steps/review/proposed.diff` and `steps/review/tests.txt`. The approval
+binds the branch, base commit, patch, and evidence. If the base branch moves before publishing a new
+draft, submit the issue again so the new base can be tested and reviewed. The workflow concludes once
+GitHub confirms the draft, and a person can review it and merge it through the repository's normal process.
+
 ## Configure models and bots
 
 `bots.yaml` has four layers.

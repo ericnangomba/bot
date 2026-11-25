@@ -249,7 +249,7 @@ class Telegram:
     def handle_message(self, scope, update_id, message):
         text = message.get("text", "").strip()
         if text.startswith("/"):
-            self.command(scope, text)
+            self.command(scope, text, update_id)
             return
         if message.get("voice"):
             voice = message["voice"]
@@ -398,7 +398,7 @@ class Telegram:
             except TransportError:
                 pass
 
-    def command(self, scope, message):
+    def command(self, scope, message, update_id=None):
         command, _, remainder = message.partition(" ")
         command, _, mention = command.lower().partition("@")
         remainder = remainder.strip()
@@ -407,9 +407,13 @@ class Telegram:
         if command in {"/start", "/help"}:
             self.send(scope, "Send a goal as text or a voice note. Send a file with a caption, or stage files "
                       "and send the goal next.\n\n"
-                      "/status [id] · /tasks · /bots · /logs [id]\n"
+                      "/issue <number> · /status [id] · /tasks · /bots · /logs [id]\n"
                       "/pause [id] · /resume [id] · /cancel <id> · /retry <id>\n"
                       "/answer <approval_id> <answer> · /artifact <id> <path> · /clearfiles")
+        elif command == "/issue":
+            task = self.engine.submit(remainder, "github_issue", {},
+                                      telegram_origin=(update_id, *scope.keys()) if update_id is not None else None)
+            self.send(scope, f"Queued GitHub issue job {task[:8]}. Use /status {task[:8]} to follow it.")
         elif command == "/bots":
             overview = ["Director — planning, scheduling, and final review"]
             overview.extend(f"{bot['id']} — {', '.join(bot['capabilities'])} · {' → '.join(bot['route'])}"

@@ -79,7 +79,9 @@ def parser():
     submit = subs.add_parser("submit")
     submit.add_argument("goal")
     submit.add_argument("--file", type=Path, action="append", default=[])
-    submit.add_argument("--demo", action="store_true")
+    submit_mode = submit.add_mutually_exclusive_group()
+    submit_mode.add_argument("--demo", action="store_true")
+    submit_mode.add_argument("--github-issue", action="store_true", help="Run the configured GitHub issue workflow")
     subs.add_parser("health")
     listing = subs.add_parser("list")
     listing.add_argument("--limit", type=int, default=30)
@@ -119,7 +121,7 @@ def main():
         if len({path.name for path in args.file}) != len(args.file):
             raise ValueError("Attachment basenames must be unique")
         attachments = {path.name: base64.b64encode(read_bytes(path)).decode() for path in args.file}
-        display(api("/tasks", {"goal": args.goal, "mode": "demo" if args.demo else "live", "attachments": attachments}))
+        display(api("/tasks", {"goal": args.goal, "mode": "github_issue" if args.github_issue else "demo" if args.demo else "live", "attachments": attachments}))
     elif command == "health":
         display(api("/healthz"))
     elif command == "list":

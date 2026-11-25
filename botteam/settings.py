@@ -8,7 +8,7 @@ import yaml
 IDENT = re.compile(r"[a-z][a-z0-9_-]{0,39}\Z")
 TOOLS = {"read", "write", "search", "fetch", "exec", "patch", "publish",
          "integration", "pull_request", "schedule", "clarify"}
-EFFECTS = {"integration", "pull_request"}
+EFFECTS = {"integration", "pull_request", "github_draft"}
 GATED = EFFECTS | {"publish", "schedule"}
 
 

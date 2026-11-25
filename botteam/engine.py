@@ -11,6 +11,7 @@ import time
 import uuid
 
 from .actions import Toolbox, Transient, bind_action, path_under, save_attachments, text_arg
+from .github_workflow import GitHubWorkflow, MODE as GITHUB_MODE, TOOLS as GITHUB_TOOLS, TOOLS_BY_STEP, issue_goal
 from .models import CONTRACTS, Model
 from .routing import BudgetExceeded, RateLimited
 from .settings import EFFECTS, GATED, validate_plan
@@ -18,7 +19,7 @@ from .store import Store, encode, event
 
 LOG = logging.getLogger("botteam")
 TERMINAL = {"completed", "failed", "cancelled"}
-MUTATING = GATED | {"write", "patch", "exec"}
+MUTATING = GATED | {"write", "patch", "exec", "github_verify"}
 MAX_GOAL = 7000
 REPLY_FEEDBACK = {"completion_validation", "proposal_validation"}
 
@@ -67,6 +68,7 @@ class Engine:
         self.bots = {bot["id"]: bot for bot in config["bots"]}
         self.capabilities = sorted({cap for profile in self.bots.values() for cap in profile["capabilities"]})
         self.tools = Toolbox(self.root, self.policy)
+        self.github = GitHubWorkflow(config, self.tools)
         self.model = Model(config, self.reserve)
         self.stop = threading.Event()
         self.heartbeat = 0.0
@@ -85,7 +87,7 @@ class Engine:
         with self.store.tx() as db:
             for step in db.execute("SELECT * FROM steps WHERE state IN ('assigned','in_progress')").fetchall():
                 task, name = step["task"], step["id"]
-                if step["effect"]:
+                if step["effect"] and not self.resumable_draft(step):
                     message = "Daemon restarted during an external action. Check the destination for its outcome."
                     db.execute("UPDATE steps SET state='failed',result=? WHERE task=? AND id=?",
                                (encode({"summary": message}), task, name))
@@ -122,7 +124,7 @@ class Engine:
     def validate_goal(goal, mode):
         if not isinstance(goal, str) or not goal.strip() or len(goal) > MAX_GOAL:
             raise ValueError(f"Goal must contain 1 to {MAX_GOAL} characters")
-        if mode not in {"live", "demo"}:
+        if mode not in {"live", "demo", GITHUB_MODE}:
             raise ValueError("Unknown task mode")
 
     def insert_task(self, db, goal, mode, task_id):
@@ -138,6 +140,13 @@ class Engine:
 
     def _submit(self, goal, mode, attachments, telegram_origin, web_request, telegram_scope):
         self.validate_goal(goal, mode)
+        if mode == GITHUB_MODE:
+            self.github.preflight()
+            if self.model.offline:
+                raise ValueError("GitHub issue work requires live models")
+            goal = f"GitHub issue #{issue_goal(goal)}"
+            if attachments:
+                raise ValueError("GitHub issue jobs take their inputs from the repository and issue")
         if telegram_origin:
             update_id, *scope = telegram_origin
             with self.store.tx(write=False) as db:
@@ -146,7 +155,8 @@ class Engine:
                     return existing["task"]
                 drafts = db.execute("SELECT name,content FROM telegram_drafts WHERE user_id=? AND chat_id=? "
                                     "AND topic=?", scope)
-                attachments = {**{row["name"]: row["content"] for row in drafts}, **attachments}
+                if mode != GITHUB_MODE:
+                    attachments = {**{row["name"]: row["content"] for row in drafts}, **attachments}
         if web_request:
             request_id, fingerprint = web_request
             with self.store.tx(write=False) as db:
@@ -169,7 +179,8 @@ class Engine:
                     db.execute("INSERT INTO telegram_origins VALUES(?,?,?,?,?)", (task, update_id, *telegram_scope))
                 if telegram_origin:
                     db.execute("INSERT INTO telegram_origins VALUES(?,?,?,?,?)", (task, *telegram_origin))
-                    db.execute("DELETE FROM telegram_drafts WHERE user_id=? AND chat_id=? AND topic=?", scope)
+                    if mode != GITHUB_MODE:
+                        db.execute("DELETE FROM telegram_drafts WHERE user_id=? AND chat_id=? AND topic=?", scope)
         except BaseException:
             shutil.rmtree(workspace, ignore_errors=True)
             raise
@@ -416,11 +427,12 @@ class Engine:
                                       "ORDER BY seq DESC LIMIT 1", (task_id,)).fetchone()
             if feedback:
                 context["plan_feedback"] = json.loads(feedback["data"])["error"]
-            candidate = self.model.plan(task_id, context, self.capabilities)
+            candidate = (self.github.plan() if task["mode"] == GITHUB_MODE
+                         else self.model.plan(task_id, context, self.capabilities))
             try:
                 plan = validate_plan(candidate, self.capabilities)
             except (ValueError, TypeError, AttributeError) as exc:
-                if feedback or self.model.offline:
+                if feedback or self.model.offline or task["mode"] == GITHUB_MODE:
                     raise
                 # A rejected proposal has no accepted steps or side effects. Allow one
                 # fresh plan with feedback, through the normal rate/budget scheduler.
@@ -454,7 +466,10 @@ class Engine:
                 for step in steps:
                     step["result"]["summary"] = step["result"]["summary"][:300]
                     step["result"]["artifacts"] = step["result"]["artifacts"][:2]
-            result = self.model.finish(task_id, context)
+            if task["mode"] == GITHUB_MODE:
+                result = next(step["result"]["summary"] for step in steps if step["id"] == "draft")
+            else:
+                result = self.model.finish(task_id, context)
             if isinstance(result, str):
                 result = {"summary": result, "passed": True}
         except Exception as exc:
@@ -510,6 +525,12 @@ class Engine:
             allowed -= MUTATING
         return allowed
 
+    def step_tools(self, profile, row, mode):
+        allowed = self.allowed_tools(profile, row["capability"])
+        if mode == GITHUB_MODE:
+            allowed &= {"read", "write"} if row["id"] == "build" else {"read"}
+        return allowed
+
     def context(self, task, row, profile):
         task_id, name = task["id"], row["id"]
         with self.store.tx(write=False) as db:
@@ -521,7 +542,7 @@ class Engine:
                 "SELECT step,state,result FROM runs WHERE task=? AND bot=? ORDER BY seq DESC LIMIT 3",
                 (task_id, profile["id"]))]
         observations = json.loads(row["observations"])
-        allowed = self.allowed_tools(profile, row["capability"])
+        allowed = self.step_tools(profile, row, task["mode"])
         if last_clarification(observations):
             allowed.discard("clarify")
         context = {
@@ -565,9 +586,20 @@ class Engine:
             else:
                 if row["turns"] >= self.policy["max_turns"]:
                     raise ValueError("Worker turn limit reached")
-                reply = self.model.worker(task_id, profile, self.context(task, row, profile))
+                reply = None
+                if task["mode"] == GITHUB_MODE:
+                    review = []
+                    if name == "draft":
+                        with self.store.tx(write=False) as db:
+                            evidence = db.execute("SELECT observations FROM steps WHERE task=? AND id='review'",
+                                                  (task_id,)).fetchone()
+                            review = json.loads(evidence["observations"])
+                    reply = self.github.next_reply(self.projects / task_id, task, row, review)
+                internal = reply is not None
+                if reply is None:
+                    reply = self.model.worker(task_id, profile, self.context(task, row, profile))
                 if "tool" in reply:
-                    self.propose(task_id, row, profile, reply)
+                    self.propose(task_id, row, profile, reply, mode=task["mode"], internal=internal)
                 else:
                     self.complete(task_id, row, profile, reply)
         except Exception as exc:
@@ -577,6 +609,7 @@ class Engine:
                 if not terminal and not current["effect"]:
                     if isinstance(exc, WorkerReplyError) and self.repair_worker_reply(db, current, exc):
                         return
+                if not terminal and (not current["effect"] or self.resumable_draft(current)):
                     if self.defer(db, task_id, name, current["attempts"], exc):
                         self.refresh(db, task_id)
                         return
@@ -589,6 +622,10 @@ class Engine:
                 self.log_run(db, task_id, name, profile["id"], "failed", {"summary": message})
                 if not terminal:
                     self.fail_task(db, task_id, f"{name} failed: {message}")
+
+    @staticmethod
+    def resumable_draft(row):
+        return row["id"] == "draft" and row["action"] and json.loads(row["action"])["tool"] == "github_draft"
 
     def repair_worker_reply(self, db, row, error):
         observations = json.loads(row["observations"])
@@ -612,10 +649,13 @@ class Engine:
             return True
         return False
 
-    def propose(self, task, row, profile, reply):
+    def propose(self, task, row, profile, reply, *, mode="live", internal=False):
         name = reply["tool"]
         args = reply.get("args")
-        if not isinstance(name, str) or name not in self.allowed_tools(profile, row["capability"]):
+        allowed = self.step_tools(profile, row, mode)
+        if internal:
+            allowed = {TOOLS_BY_STEP[row["id"]]}
+        if not isinstance(name, str) or name not in allowed:
             raise WorkerReplyError("Worker requested a tool outside its policy", "proposal",
                                    {"guidance": "Choose a tool from the tools available to this step."})
         step = row["id"]
@@ -631,6 +671,8 @@ class Engine:
         except ValueError as exc:
             raise WorkerReplyError(str(exc), "proposal",
                                    {"guidance": "Correct the arguments using the tool contract."}) from exc
+        if name == "github_draft":
+            action["destination"] = f"https://github.com/{args['repo']}/pulls"
         action["nonce"] = uuid.uuid4().hex
         with self.store.tx() as db:
             if self.task_row(db, task)["status"] in TERMINAL:
@@ -661,14 +703,29 @@ class Engine:
         step = row["id"]
         action = json.loads(row["action"])
         tool = action["tool"]
-        if tool not in self.allowed_tools(profile, row["capability"]):
-            raise ValueError("Tool is no longer allowed by policy")
         digest = hashlib.sha256(encode(action).encode()).hexdigest()
         gate = tool in GATED or tool == "clarify" or (
             self.policy["autonomy"] == "confirm_all" and tool in MUTATING)
         with self.store.tx() as db:
             if self.stopped_before_claim(db, task, step):
                 return
+            mode = self.task_row(db, task)["mode"]
+            if tool in GITHUB_TOOLS:
+                if mode != GITHUB_MODE or tool != TOOLS_BY_STEP.get(step):
+                    raise ValueError("GitHub workflow tool is outside its assigned step")
+                self.github.preflight()
+                if tool == "github_draft":
+                    args = action["args"]
+                    receipt = db.execute("SELECT observations FROM steps WHERE task=? AND id='review' "
+                                         "AND state='completed'", (task,)).fetchone()
+                    if receipt is None:
+                        raise ValueError("The GitHub patch still needs review")
+                    evidence = next((item["result"] for item in reversed(json.loads(receipt["observations"]))
+                                     if item["tool"] == "github_verify"), {})
+                    if args != self.github.draft_args(self.projects / task, evidence):
+                        raise ValueError("GitHub patch changed after preparation")
+            elif tool not in self.step_tools(profile, row, mode):
+                raise ValueError("Tool is no longer allowed by policy")
             approval = db.execute("SELECT * FROM approvals WHERE task=? AND step=? AND digest=?",
                                   (task, step, digest)).fetchone()
             if gate and approval is None:
@@ -701,14 +758,18 @@ class Engine:
                 self.record_tool(db, task, row, action, {"schedule": schedule})
                 return
             if tool in EFFECTS:
-                if not approval or approval["state"] != "approved":
+                if not approval or (approval["state"] != "approved" and
+                                    not (row["effect"] and self.resumable_draft(row))):
                     raise Conflict("External action approval has already been consumed")
                 db.execute("UPDATE steps SET effect=1 WHERE task=? AND id=?", (task, step))
             event(db, task, "tool_started", {"tool": tool, "digest": digest}, step)
         try:
-            result = self.tools.run(self.projects / task, step, action, digest)
+            if tool in GITHUB_TOOLS:
+                result = self.github.run(self.projects / task, action)
+            else:
+                result = self.tools.run(self.projects / task, step, action, digest)
         except (ValueError, OSError) as exc:
-            if tool in EFFECTS:
+            if tool in EFFECTS or tool == "github_checkout":
                 raise
             result = {"error": str(exc)[:700]}
         with self.store.tx() as db:
