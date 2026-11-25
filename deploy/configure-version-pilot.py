@@ -1,4 +1,5 @@
-"""Configure the one-time GitHub issue #1 pilot on the Bot Team VM."""
+"""Configure the GitHub pilot or switch Bot Team to an existing Ollama server."""
+import argparse
 import getpass
 import json
 import os
@@ -16,7 +17,7 @@ import yaml
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
 
-from botteam.actions import Toolbox  # noqa: E402
+from botteam.actions import Toolbox, Transient, request  # noqa: E402
 from botteam.github_workflow import GitHubWorkflow  # noqa: E402
 from botteam.settings import read_config  # noqa: E402
 
@@ -138,20 +139,102 @@ def process_config(process):
     return (path if path.is_absolute() else (process / "cwd").resolve() / path).resolve()
 
 
-def check_ready(config_path, token):
+def check_ready(config_path, token=None):
     for _ in range(30):
         try:
             with urlopen("http://127.0.0.1:8042/healthz", timeout=2) as response:
                 health = json.load(response)
-            if health["ready"] and (not health["telegram_configured"] or health["telegram_polling"]):
+            if (health["ready"] and (token is not None or health.get("model_configured")) and
+                    (not health["telegram_configured"] or health["telegram_polling"])):
                 process = service_process()
-                entries = (process / "environ").read_bytes().split(b"\0")
-                if process_config(process) == config_path and f"{TOKEN_KEY}={token}".encode() in entries:
-                    return
+                if process_config(process) == config_path:
+                    if token is None:
+                        return
+                    entries = (process / "environ").read_bytes().split(b"\0")
+                    if f"{TOKEN_KEY}={token}".encode() in entries:
+                        return
         except (OSError, URLError, ValueError, subprocess.SubprocessError):
             pass
         time.sleep(1)
-    raise RuntimeError("Bot Team did not become ready with the pilot config and token.")
+    target = "the pilot config and token" if token is not None else "the Ollama config"
+    raise RuntimeError(f"Bot Team did not become ready with {target}.")
+
+
+def ollama_config(text, model, port):
+    config = yaml.safe_load(text)
+    alias = "ollama_local_only"
+    config["provider"] = "live"
+    config["providers"][alias] = {
+        "kind": "ollama", "base_url": f"http://127.0.0.1:{port}",
+        "rpm": 60, "concurrency": 1, "timeout_seconds": 180,
+    }
+    config["models"][alias] = {"provider": alias, "name": model, "input_usd_m": 0, "output_usd_m": 0}
+    config["inference"].update(keep_alive=600, local_idle_seconds=600, local_max_parallel=1)
+    for profile in [config["director"], *config["bots"]]:
+        profile.update(primary=alias, fallbacks=[])
+        # Keep the context allocation and lifetime consistent when bots share one loaded model.
+        overrides = profile.get("inference", {})
+        overrides.pop("context_length", None)
+        overrides.pop("keep_alive", None)
+    config["policy"]["budget_usd"] = 0
+    return yaml.safe_dump(config, sort_keys=False)
+
+
+def probe_ollama(config):
+    route = config["director"]["primary"]
+    model = config["models"][route]["name"]
+    provider = config["providers"][route]
+    url = provider["base_url"]
+    timeout = provider["timeout_seconds"]
+    _, body = request(url + "/api/tags", 5, local=True)
+    installed = json.loads(body)["models"]
+    if not any(entry.get("name") == model and entry.get("size", 0) > 0
+               and not entry.get("remote_host") and not entry.get("remote_model") for entry in installed):
+        raise ValueError(f"{model} must be installed locally on the Ollama server. Use the full model tag.")
+    payload = {
+        "model": model, "format": "json", "stream": False, "keep_alive": "600s",
+        "messages": [{"role": "user", "content": 'Return only the JSON object {"ok":true}.'}],
+        "options": {"num_ctx": config["inference"]["context_length"], "num_predict": 256, "temperature": 0},
+    }
+    print(f"Checking {model} on VM loopback. Model loading may take a while.", flush=True)
+    for label in ("First request", "Warm request"):
+        started = time.monotonic()
+        _, body = request(url + "/api/chat", timeout, payload=payload, local=True)
+        reply = json.loads(body)
+        if (not reply.get("done") or reply.get("done_reason") == "length" or
+                json.loads(reply["message"]["content"]) != {"ok": True}):
+            raise ValueError(f"{model} did not pass the structured response check.")
+        print(f"{label}: {time.monotonic() - started:.1f}s", flush=True)
+
+
+def configure_ollama(model, port):
+    if os.geteuid() != 0:
+        raise ValueError("Run this setup with sudo on the Bot Team VM.")
+    if not 1 <= port <= 65535 or not model or model.lower().endswith((":cloud", "-cloud")):
+        raise ValueError("Supply a local model tag and valid Ollama port.")
+    path = process_config(service_process())
+    original = path.read_text()
+    updated = ollama_config(original, model, port)
+    with tempfile.TemporaryDirectory(prefix="botteam-ollama-check-") as directory:
+        candidate = Path(directory) / "bots.yaml"
+        candidate.write_text(updated)
+        config = read_config(candidate)
+        probe_ollama(config)
+    if updated != original:
+        backup = Path(tempfile.mkdtemp(prefix="botteam-ollama-", dir="/var/backups")) / path.name
+        backup.write_text(original)
+        write_config(path, updated)
+        try:
+            subprocess.run(["systemctl", "restart", "botteam"], check=True, timeout=60)
+            check_ready(path)
+        except (Exception, KeyboardInterrupt):
+            write_config(path, original)
+            subprocess.run(["systemctl", "restart", "botteam"], check=True, timeout=60)
+            raise
+        print(f"Previous config saved at {backup}.")
+    else:
+        check_ready(path)
+    print(f"Bot Team now uses {model} for all agent inference.")
 
 
 def main():
@@ -205,8 +288,15 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ollama", metavar="MODEL", help="Route every bot to this installed local Ollama model")
+    parser.add_argument("--ollama-port", type=int, default=11434, help="Ollama port on VM loopback")
+    args = parser.parse_args()
     try:
-        main()
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        print(f"Bot Team pilot setup stopped: {error}", file=sys.stderr)
+        if args.ollama is None:
+            main()
+        else:
+            configure_ollama(args.ollama, args.ollama_port)
+    except (OSError, KeyError, ValueError, RuntimeError, Transient, subprocess.SubprocessError) as error:
+        print(f"Bot Team setup stopped: {error}", file=sys.stderr)
         sys.exit(1)

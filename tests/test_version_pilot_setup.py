@@ -93,3 +93,52 @@ class VersionPilotSetupTests(unittest.TestCase):
                 ready(self.config, self.token)
             environment.write_bytes(f"BOTTEAM_GITHUB_TOKEN={self.token}\0".encode())
             ready(self.config, self.token)
+
+    def test_ollama_setup_probes_before_switching_all_bots(self):
+        original = self.script["pilot_config"](self.config.read_text())
+        self.config.write_text(original)
+        environment = self.environment.read_bytes()
+        setup = self.script["configure_ollama"]
+        responses = [
+            (200, '{"models":[{"name":"qwen2.5-coder:latest","size":4700000000}]}'),
+            (200, '{"done":true,"message":{"content":"{\\"ok\\":true}"}}'),
+            (200, '{"done":true,"message":{"content":"{\\"ok\\":true}"}}'),
+        ]
+        calls = []
+
+        def request(url, timeout, **options):
+            self.assertEqual(self.config.read_text(), original)
+            self.assertTrue(options["local"])
+            calls.append((url, timeout, options))
+            return responses.pop(0)
+
+        with patch.dict(setup.__globals__, {"request": request, "check_ready": Mock()}):
+            with patch("subprocess.run") as restart:
+                setup("qwen2.5-coder:latest", 11435)
+        restart.assert_called_once()
+        self.assertEqual([url for url, _, _ in calls], [
+            "http://127.0.0.1:11435/api/tags", "http://127.0.0.1:11435/api/chat",
+            "http://127.0.0.1:11435/api/chat",
+        ])
+        self.assertEqual([timeout for _, timeout, _ in calls], [5, 180, 180])
+        config = yaml.safe_load(self.config.read_text())
+        self.assertTrue(all(profile["primary"] == "ollama_local_only" and profile["fallbacks"] == []
+                            for profile in [config["director"], *config["bots"]]))
+        self.assertEqual(config["github_workflow"], self.script["RECIPE"])
+        self.assertEqual(self.environment.read_bytes(), environment)
+
+    def test_ollama_rejects_cloud_models_and_restores_config_if_restart_unready(self):
+        before = self.config.read_bytes()
+        setup = self.script["configure_ollama"]
+        probe = Mock()
+        with patch.dict(setup.__globals__, {"probe_ollama": probe,
+                                            "check_ready": Mock(side_effect=RuntimeError("unready"))}):
+            with patch("subprocess.run") as restart:
+                with self.assertRaisesRegex(ValueError, "local model"):
+                    setup("model:cloud", 11434)
+                probe.assert_not_called()
+                restart.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "unready"):
+                    setup("qwen2.5-coder:latest", 11434)
+        self.assertEqual(restart.call_count, 2)
+        self.assertEqual(self.config.read_bytes(), before)

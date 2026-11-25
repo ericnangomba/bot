@@ -137,6 +137,24 @@ Rate limits, timeouts, busy providers and unavailable models advance the route. 
 
 Use a model that fits your memory budget at the selected context and concurrency. The configured limits bound admissions and KV use, with the model server and host responsible for actual RAM and VRAM limits. The worker prompt keeps role instructions and a task prefix stable across turns and sends bounded dependency outputs, recent observations, attachment paths, and task-scoped history. Parsing, DAG validation, file writes, diffs, hashing, and budget checks use deterministic code.
 
+### Use local Ollama for every bot
+
+On the systemd VM, run the command below with the full tag of a model already installed on the Ollama server.
+
+```bash
+sudo /opt/bot-team/.venv/bin/python /opt/bot-team/deploy/configure-version-pilot.py --ollama qwen2.5-coder:latest
+```
+
+Setup probes JSON generation twice and reports first-request and warm-request times before changing the live config. It selects the same model for every role, serializes model calls, keeps the model loaded for ten idle minutes, and allows up to three minutes per request. It backs up the previous YAML and restores it if Bot Team fails its post-restart check. Use the server setting `OLLAMA_NO_CLOUD=1` to disable Ollama cloud features. Telegram voice transcription has its own provider and can be disabled with `TELEGRAM_VOICE_PER_HOUR=0`.
+
+If Ollama runs on a separate PC, keep its HTTP listener private. For an initial test from the PC, forward Ollama through SSH and leave the terminal open.
+
+```powershell
+ssh -NT -o ExitOnForwardFailure=yes -R 127.0.0.1:11435:127.0.0.1:11434 user@bot-team-vm
+```
+
+In a second terminal, connect to the VM and add `--ollama-port 11435` to the setup command. The PC and tunnel must stay up while jobs use this endpoint. For unattended service use an always-on host for inference.
+
 ## Controls and guardrails
 
 | Autonomy | Behavior |
