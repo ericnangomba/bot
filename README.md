@@ -74,6 +74,16 @@ recognize an existing matching draft.
    use `python -m botteam submit 42 --github-issue`. The authenticated API can submit
    `{"goal":"42","mode":"github_issue"}` to `POST /tasks`.
 
+For the **issue #1 version-command pilot on the Bot Team VM**, use the setup helper from an
+interactive SSH terminal. It prompts privately for the token, checks out the issue, applies the tested
+recipe, and rolls back its configuration edits if the service fails its readiness check.
+
+```sh
+sudo /opt/bot-team/.venv/bin/python /opt/bot-team/deploy/configure-version-pilot.py
+```
+
+When setup reports readiness, send `/issue 1` in Telegram.
+
 Example recipe for a small Python module, with names to replace for your repository:
 
 ```yaml
