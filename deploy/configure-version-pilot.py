@@ -21,7 +21,6 @@ from botteam.github_workflow import GitHubWorkflow  # noqa: E402
 from botteam.settings import read_config  # noqa: E402
 
 REPO = "ericnangomba/bot"
-CONFIG = APP / "bots.yaml"
 ENV_FILE = Path("/etc/botteam.env")
 TOKEN_KEY = "BOTTEAM_GITHUB_TOKEN"
 TOKEN_LINE = re.compile(r"^[ \t]*BOTTEAM_GITHUB_TOKEN[ \t]*=(.*)$")
@@ -114,23 +113,52 @@ def write_config(path, content, mode=None):
         Path(temporary).unlink(missing_ok=True)
 
 
-def check_ready():
+def service_process():
+    result = subprocess.run(
+        ["systemctl", "show", "botteam", "--property=MainPID", "--value"],
+        check=True, capture_output=True, text=True, timeout=10,
+    )
+    pid = result.stdout.strip()
+    if not pid.isdecimal() or int(pid) == 0:
+        raise ValueError("Start the Bot Team service before running setup.")
+    return Path("/proc") / pid
+
+
+def process_config(process):
+    args = [os.fsdecode(arg) for arg in (process / "cmdline").read_bytes().split(b"\0") if arg]
+    if "-m" not in args or args[args.index("-m") + 1:args.index("-m") + 3] != ["botteam", "serve"]:
+        raise ValueError("The systemd process is not running the Bot Team CLI.")
+    config = "bots.yaml"
+    for index, arg in enumerate(args):
+        if arg == "--config" and index + 1 < len(args):
+            config = args[index + 1]
+        elif arg.startswith("--config="):
+            config = arg.partition("=")[2]
+    path = Path(config)
+    return (path if path.is_absolute() else (process / "cwd").resolve() / path).resolve()
+
+
+def check_ready(config_path, token):
     for _ in range(30):
         try:
             with urlopen("http://127.0.0.1:8042/healthz", timeout=2) as response:
                 health = json.load(response)
             if health["ready"] and (not health["telegram_configured"] or health["telegram_polling"]):
-                return
-        except (OSError, URLError, ValueError):
+                process = service_process()
+                entries = (process / "environ").read_bytes().split(b"\0")
+                if process_config(process) == config_path and f"{TOKEN_KEY}={token}".encode() in entries:
+                    return
+        except (OSError, URLError, ValueError, subprocess.SubprocessError):
             pass
         time.sleep(1)
-    raise RuntimeError("Bot Team did not become ready after restart.")
+    raise RuntimeError("Bot Team did not become ready with the pilot config and token.")
 
 
 def main():
     if os.geteuid() != 0 or not sys.stdin.isatty():
         raise ValueError("Run this setup with sudo in your interactive VM terminal.")
-    original_config, original_env = CONFIG.read_text(), ENV_FILE.read_text()
+    config_path = process_config(service_process())
+    original_config, original_env = config_path.read_text(), ENV_FILE.read_text()
     updated_config = pilot_config(original_config)
     old_token = next((match.group(1).strip().strip("\"'") for line in original_env.splitlines()
                       if (match := TOKEN_LINE.fullmatch(line))), "")
@@ -153,22 +181,22 @@ def main():
             os.environ.pop(TOKEN_KEY, None)
 
     if updated_config == original_config and updated_env == original_env:
-        check_ready()
+        check_ready(config_path, token)
         print("GitHub pilot is already configured. Send /issue 1 in Telegram.")
         return
     backup = Path(tempfile.mkdtemp(prefix="botteam-pilot-", dir="/var/backups"))
-    (backup / CONFIG.name).write_text(original_config)
+    (backup / config_path.name).write_text(original_config)
     secret_backup = backup / ENV_FILE.name
     secret_backup.touch(mode=0o600)
     secret_backup.write_text(original_env)
     env_mode = ENV_FILE.stat().st_mode & 0o777
     try:
         write_config(ENV_FILE, updated_env, mode=0o600)
-        write_config(CONFIG, updated_config)
+        write_config(config_path, updated_config)
         subprocess.run(["systemctl", "restart", "botteam"], check=True, timeout=60)
-        check_ready()
+        check_ready(config_path, token)
     except (Exception, KeyboardInterrupt):
-        write_config(CONFIG, original_config)
+        write_config(config_path, original_config)
         write_config(ENV_FILE, original_env, mode=env_mode)
         subprocess.run(["systemctl", "restart", "botteam"], check=False, timeout=60)
         raise

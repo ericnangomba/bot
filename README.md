@@ -76,7 +76,7 @@ recognize an existing matching draft.
 
 For the **issue #1 version-command pilot on the Bot Team VM**, use the setup helper from an
 interactive SSH terminal. It prompts privately for the token, checks out the issue, applies the tested
-recipe, and rolls back its configuration edits if the service fails its readiness check.
+recipe to the running service's config, and rolls back the edits if the service fails readiness checks.
 
 ```sh
 sudo /opt/bot-team/.venv/bin/python /opt/bot-team/deploy/configure-version-pilot.py
