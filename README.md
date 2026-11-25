@@ -139,6 +139,14 @@ Use a model that fits your memory budget at the selected context and concurrency
 
 ### Use local Ollama for every bot
 
+On the Ubuntu Bot Team VM, run this to install Ollama as a loopback-only systemd service, download models, and enable local inference for Bot Team.
+
+```bash
+sudo sh /opt/bot-team/deploy/install-ollama.sh
+```
+
+Setup selects the 3B or 7B Qwen2.5-Coder model based on available memory and storage. It also downloads Qwen2.5 3B for general use when storage permits. Bot Team uses only the selected coding model, so its roles can share the same loaded model. The official installer may configure GPU drivers if it detects supported hardware. Both service and model files live on the VM.
+
 On the systemd VM, run the command below with the full tag of a model already installed on the Ollama server.
 
 ```bash
