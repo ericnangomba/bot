@@ -104,7 +104,7 @@ class Router:
     def headers(key):
         return {"Authorization": f"Bearer {key}"} if key else {}
 
-    def call(self, task, profile, messages):
+    def call(self, task, profile, messages, *, schema=None):
         request_bytes = encode(messages).encode()
         estimated_input = len(request_bytes) + 128
         request_hash = hashlib.sha256(request_bytes).digest()
@@ -137,7 +137,7 @@ class Router:
                     self.reserve(*reservation)
                     try:
                         result = self.invoke(provider, model, messages, inference, context, output, key, keep_alive,
-                                             use_json_mode=not needs_plain)
+                                             use_json_mode=not needs_plain, schema=schema)
                     except ProviderRequestError as exc:
                         groq = urlsplit(provider["base_url"]).hostname == "api.groq.com"
                         generic_groq = groq and exc.code in (None, "invalid_request_error")
@@ -180,12 +180,13 @@ class Router:
             raise BudgetExceeded("Task budget prevents the remaining model routes")
         raise ValueError("No usable model route (" + "; ".join(reasons) + ")")
 
-    def invoke(self, provider, model, messages, inference, context, output, key, keep_alive, *, use_json_mode=True):
+    def invoke(self, provider, model, messages, inference, context, output, key, keep_alive, *,
+               use_json_mode=True, schema=None):
         kind = provider["kind"]
         timeout = provider.get("timeout_seconds", self.policy["model_timeout_seconds"])
         if kind == "ollama":
             url = self.url(provider, "api/chat")
-            payload = {"model": model["name"], "messages": messages, "stream": False, "format": "json",
+            payload = {"model": model["name"], "messages": messages, "stream": False, "format": schema or "json",
                        "keep_alive": f"{keep_alive}s",
                        "options": {"num_ctx": context, "num_predict": output, "temperature": inference["temperature"]}}
         else:

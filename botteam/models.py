@@ -34,18 +34,40 @@ class Model:
     def configured(self):
         return self.offline or self.router.configured()
 
-    def call(self, task, profile, instruction, data):
+    def call(self, task, profile, instruction, data, *, schema=None):
         prefix = {"project": task, "goal": data["goal"]}
         messages = [{"role": "system", "content": SAFETY + " " + instruction},
                     {"role": "user", "content": encode(prefix) + "\n\n" +
                      encode({key: value for key, value in data.items() if key != "goal"})}]
-        return self.router.call(task, profile, messages)
+        return self.router.call(task, profile, messages, schema=schema)
 
     def plan(self, task, context, capabilities):
         if self.offline:
             if context["mode"] != "demo" or "attachments/orders.csv" not in context["attachments"]:
                 raise ValueError("Offline mode supports the demo with an orders.csv attachment")
             return demo_plan()
+        fields = {
+            "id": {"type": "string"}, "instruction": {"type": "string"},
+            "depends_on": {"type": "array", "items": {"type": "string"}},
+        }
+        steps = []
+        non_review = [capability for capability in capabilities if capability != "review"]
+        if non_review:
+            steps.append({
+                "type": "object", "additionalProperties": False,
+                "required": ["id", "capability", "instruction", "depends_on"],
+                "properties": {**fields, "capability": {"enum": non_review}},
+            })
+        if "review" in capabilities:
+            steps.append({
+                "type": "object", "additionalProperties": False,
+                "required": ["id", "capability", "instruction", "depends_on", "review_of"],
+                "properties": {**fields, "capability": {"enum": ["review"]}, "review_of": {"type": "string"}},
+            })
+        schema = {
+            "type": "object", "required": ["steps"], "additionalProperties": False,
+            "properties": {"steps": {"type": "array", "items": {"anyOf": steps}, "minItems": 1, "maxItems": 32}},
+        }
         return self.call(task, self.director,
                          "You are the Director. Return JSON with steps, a DAG of up to 32 entries. Each entry has "
                          "id, capability, instruction, depends_on (array), and review_of (REQUIRED for review capability, "
@@ -65,7 +87,7 @@ class Model:
                          "If missing task information prevents meaningful work, "
                          "plan a step that asks for it via clarify before its dependents. Scope each step to one "
                          "deliverable.",
-                         {**context, "capabilities": capabilities})
+                         {**context, "capabilities": capabilities}, schema=schema)
 
     def worker(self, task, profile, context):
         if self.offline:

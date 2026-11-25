@@ -11,6 +11,7 @@ from urllib.error import HTTPError
 
 from botteam.actions import ProviderRequestError, Transient, request
 from botteam.engine import Engine
+from botteam.models import Model
 from botteam.routing import BudgetExceeded, RateLimited, Router
 from botteam.settings import read_config
 
@@ -30,6 +31,20 @@ class TestRouting(unittest.TestCase):
     def setUp(self):
         self.config = read_config(ROOT / "bots.yaml")
         self.profile = {**self.config["director"], "route": ["local_general", "gemini_free"]}
+
+    def test_ollama_director_requests_distinct_review_and_work_step_shapes(self):
+        model = Model(self.config, lambda *args: None)
+        plan = {"steps": [{"id": "draft", "capability": "write", "depends_on": [],
+                           "instruction": "Draft the receipt."}]}
+        with patch("botteam.routing.request", return_value=ollama_reply(plan)) as call:
+            self.assertEqual(model.plan("task", {"goal": "Draft a receipt"}, ["write", "review"]), plan)
+        shape = call.call_args.args[3]["format"]
+        work, review = shape["properties"]["steps"]["items"]["anyOf"]
+        self.assertFalse(work["additionalProperties"])
+        self.assertNotIn("review_of", work["properties"])
+        self.assertEqual(work["properties"]["capability"]["enum"], ["write"])
+        self.assertIn("review_of", review["required"])
+        self.assertEqual(review["properties"]["capability"]["enum"], ["review"])
 
     def test_http_rate_limit_and_timeout_fall_back(self):
         for reason in ("HTTP 429", "HTTP transport failure (TimeoutError)", "HTTP 503"):
