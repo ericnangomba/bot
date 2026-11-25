@@ -1,4 +1,5 @@
 import json
+import re
 
 from .routing import Router
 from .store import encode
@@ -23,6 +24,23 @@ CONTRACTS = {
     "schedule": {"goal": "future task goal", "interval_seconds": "integer >= 60"},
     "clarify": {"question": "specific missing task information needed to proceed"}
 }
+DRAFT_FILENAME = re.compile(
+    r"""\bsave\b[^.!?\n]{0,100}?\bas\s+[`"']?([A-Za-z0-9][A-Za-z0-9_-]{0,63}\.(?:md|txt))"""
+    r"""(?=$|[\s`"',;!?]|\.(?:\s|$))""",
+    re.IGNORECASE,
+)
+MESSAGE_DRAFT = re.compile(
+    r"\s*draft\b[^.!?\n]{0,65}\b(?:email|reply|message|note|letter)\b[^.!?\n]{0,700}[.!?]\s*",
+    re.IGNORECASE,
+)
+
+
+def message_draft_filename(goal):
+    filename = DRAFT_FILENAME.search(goal)
+    if (filename and MESSAGE_DRAFT.fullmatch(goal[:filename.start()]) and
+            re.fullmatch(r"\s+and return it here(?: for me to review)?[.!]?\s*",
+                         goal[filename.end():].lstrip("`\"'"), re.IGNORECASE)):
+        return filename[1]
 
 
 class Model:
@@ -34,8 +52,10 @@ class Model:
     def configured(self):
         return self.offline or self.router.configured()
 
-    def call(self, task, profile, instruction, data, *, schema=None):
-        prefix = {"project": task, "goal": data["goal"]}
+    def call(self, task, profile, instruction, data, *, schema=None, include_project=True):
+        prefix = {"goal": data["goal"]}
+        if include_project:
+            prefix["project"] = task
         messages = [{"role": "system", "content": SAFETY + " " + instruction},
                     {"role": "user", "content": encode(prefix) + "\n\n" +
                      encode({key: value for key, value in data.items() if key != "goal"})}]
@@ -46,6 +66,11 @@ class Model:
             if context["mode"] != "demo" or "attachments/orders.csv" not in context["attachments"]:
                 raise ValueError("Offline mode supports the demo with an orders.csv attachment")
             return demo_plan()
+        if "write" in capabilities and not context.get("attachments"):
+            filename = message_draft_filename(context["goal"])
+            if filename:
+                return {"steps": [{"id": "draft", "capability": "write", "depends_on": [],
+                                   "instruction": f"Draft the requested message and save it as {filename}."}]}
         fields = {
             "id": {"type": "string"}, "instruction": {"type": "string"},
             "depends_on": {"type": "array", "items": {"type": "string"}},
@@ -72,7 +97,8 @@ class Model:
                          "You are the Director. Return JSON with steps, a DAG of up to 32 entries. Each entry has "
                          "id, capability, instruction, depends_on (array), and review_of (REQUIRED for review capability, "
                          "otherwise omit it). Use the smallest valid plan. For a simple writing request one write "
-                         "step is sufficient. Example: {\"steps\":[{\"id\":\"draft\",\"capability\":\"write\","
+                         "step drafts and saves the file. The service returns artifacts to the requester automatically. "
+                         "Do not add separate save or return steps. Example: {\"steps\":[{\"id\":\"draft\",\"capability\":\"write\","
                          "\"instruction\":\"Write the requested file\",\"depends_on\":[]}]}. "
                          "For a review of draft use {\"id\":\"check\",\"capability\":\"review\","
                          "\"instruction\":\"Check the draft\",\"depends_on\":[\"draft\"],\"review_of\":\"draft\"}. "
@@ -92,6 +118,13 @@ class Model:
     def worker(self, task, profile, context):
         if self.offline:
             return demo_worker(context)
+        goal = context["goal"]
+        if (context.get("capability") == "write" and "write" in context["tools"] and
+                not context["attachments"] and not context["dependencies"] and
+                re.match(r"\s*draft\b", goal, re.IGNORECASE)):
+            filename = DRAFT_FILENAME.search(goal)
+            if filename:
+                return self.draft_file(task, profile, context, filename[1])
         if "editable_files" in context:
             return self.call(task, profile, profile["persona"] + " Return exactly one JSON object per turn. "
                              'First read the issue with {"tool":"read","args":{"path":"steps/checkout/issue.md"}}. '
@@ -105,7 +138,9 @@ class Model:
         return self.call(task, profile, profile["persona"] + " Return one JSON object. To use a tool, return "
                          '{"tool":"name","args":{...}}. To finish, return {"summary":"...",'
                          '"artifacts":["workspace-relative paths"],"verdict":"pass or fail for review only"}. '
-                         "Use only listed tools. Insights from the last tool call are in observations. "
+                         "Use only listed tools. Argument descriptions describe the expected values. "
+                         "Read paths must come from the workspace inputs or tool results, never the tool contract. "
+                         "Insights from the last tool call are in observations. "
                          "Write requested files through a workspace tool and list the workspace-relative paths "
                          "returned by that tool in artifacts. Resolve any proposal_validation or "
                          "completion_validation observation before retrying the rejected reply. "
@@ -120,10 +155,35 @@ class Model:
                          "Do not use clarify for permission to run a tool or pause preparatory work solely because "
                          "a later action requires approval.", context)
 
+    def draft_file(self, task, profile, context, filename):
+        path = f"steps/{context['step']}/{filename}"
+        if path in context["own_files"] and any(
+                item["tool"] == "write" and item["result"].get("artifact") == path
+                for item in context["observations"]):
+            return {"summary": f"Saved the draft as {filename}.", "artifacts": [path]}
+        schema = {"type": "object", "required": ["content"], "additionalProperties": False,
+                  "properties": {"content": {"type": "string", "minLength": 1}}}
+        reply = self.call(task, profile,
+                          "Draft the prose requested in the goal using its supplied details and any review feedback. "
+                          'Return {"content":"the full draft text"}. Write the draft itself without a status update. '
+                          "The service saves and returns the file. Use placeholders only for unspecified details "
+                          "that are needed in the draft, such as the sender's name.",
+                          {"goal": context["goal"], "review_feedback": context["review_feedback"]},
+                          schema=schema, include_project=False)
+        content = reply.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("The model returned no draft text")
+        return {"tool": "write", "args": {"path": filename, "content": content}}
+
     def finish(self, task, context):
         if self.offline:
             writer = next(step for step in context["steps"] if step["id"] == "report")
             return writer["result"]["summary"]
+        filename = message_draft_filename(context["goal"])
+        if filename and len(context["steps"]) == 1 and context["steps"][0]["id"] == "draft":
+            if f"steps/draft/{filename}" not in context["steps"][0]["result"]["artifacts"]:
+                return {"summary": f"The requested draft {filename} was not saved.", "passed": False}
+            return {"summary": f"Saved the draft as {filename}.", "passed": True}
         reply = self.call(task, self.director, "Review the step outputs against the original goal. Return JSON "
                           "with summary (string) and verdict (pass or fail). State what was delivered, verified, "
                           "and still outstanding. Mark fail if a core requirement is unmet. Do not make up evidence.",

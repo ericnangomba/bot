@@ -46,6 +46,29 @@ class TestRouting(unittest.TestCase):
         self.assertIn("review_of", review["required"])
         self.assertEqual(review["properties"]["capability"]["enum"], ["review"])
 
+    def test_self_contained_named_draft_writes_before_reported_completion(self):
+        model = Model(self.config, lambda *args: None)
+        writer = next(bot for bot in self.config["bots"] if bot["id"] == "writer")
+        context = {"goal": "Draft an invoice receipt email. Save it as receipt.md and return it here.",
+                   "step": "draft", "capability": "write", "tools": {"read": {}, "write": {}},
+                   "attachments": [], "dependencies": {}, "own_files": [], "observations": [], "review_feedback": None}
+        with patch("botteam.routing.request", return_value=ollama_reply({"content": "Invoice received."})) as call:
+            plan = model.plan("task", {"goal": context["goal"], "attachments": []}, ["write", "review"])
+            self.assertEqual([(step["id"], step["capability"]) for step in plan["steps"]], [("draft", "write")])
+            call.assert_not_called()
+            reply = model.worker("task", writer, context)
+            self.assertEqual(reply, {"tool": "write", "args": {"path": "receipt.md", "content": "Invoice received."}})
+            artifact = "steps/draft/receipt.md"
+            context["own_files"] = [artifact]
+            context["observations"] = [{"tool": "write", "result": {"artifact": artifact}}]
+            self.assertEqual(model.worker("task", writer, context),
+                             {"summary": "Saved the draft as receipt.md.", "artifacts": [artifact]})
+            final = model.finish("task", {"goal": context["goal"], "steps": [
+                {"id": "draft", "result": {"artifacts": [artifact]}},
+            ]})
+            self.assertEqual(final, {"summary": "Saved the draft as receipt.md.", "passed": True})
+        call.assert_called_once()
+
     def test_http_rate_limit_and_timeout_fall_back(self):
         for reason in ("HTTP 429", "HTTP transport failure (TimeoutError)", "HTTP 503"):
             with self.subTest(reason=reason), patch.dict(os.environ, {"GEMINI_API_KEY": "fixture"}):

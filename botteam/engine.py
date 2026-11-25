@@ -586,7 +586,7 @@ class Engine:
         if last_clarification(observations):
             allowed.discard("clarify")
         context = {
-            "goal": task["goal"], "step": name, "instruction": row["instruction"],
+            "goal": task["goal"], "step": name, "capability": row["capability"], "instruction": row["instruction"],
             "review_of": row["review_of"], "review_feedback": row["feedback"],
             "attachments": [path for path in self.files(task_id) if path.startswith("attachments/")],
             "dependencies": dependencies, "observations": observations,
