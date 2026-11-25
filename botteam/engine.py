@@ -557,6 +557,19 @@ class Engine:
                              "integrations": sorted(self.policy["integrations"]),
                              "github_repo": self.policy["github_repo"]}
         }
+        if task["mode"] == GITHUB_MODE and name == "build" and "write" in allowed:
+            context["tools"]["write"] = {
+                "path": "an allowed write path from editable_files",
+                "old": "exact unique source text to replace",
+                "new": "replacement text",
+                "content": "full replacement text, only when omitting old and new",
+            }
+            context["editable_files"] = [
+                {"read": (f"steps/build/changes/{path}" if f"steps/build/changes/{path}" in context["own_files"]
+                          else f"steps/checkout/source/{path}"),
+                 "write": f"changes/{path}"}
+                for path in self.github.recipe["editable_paths"]
+            ]
         if not self.model.offline:
             bound = self.policy["max_input_tokens"] // 2
             while history and len(encode(context).encode()) > bound:
@@ -601,7 +614,7 @@ class Engine:
                 if "tool" in reply:
                     self.propose(task_id, row, profile, reply, mode=task["mode"], internal=internal)
                 else:
-                    self.complete(task_id, row, profile, reply)
+                    self.complete(task_id, row, profile, reply, mode=task["mode"])
         except Exception as exc:
             with self.store.tx() as db:
                 current = db.execute("SELECT * FROM steps WHERE task=? AND id=?", (task_id, name)).fetchone()
@@ -664,6 +677,8 @@ class Engine:
                 raise ValueError("Invalid or oversized tool arguments")
             if name == "clarify":
                 text_arg(args, "question", 1500)
+            if name == "write" and mode == GITHUB_MODE:
+                args = self.github.build_write_args(self.projects / task, args)
             action = bind_action(name, args, self.projects / task, self.policy)
         except FileNotFoundError as exc:
             raise WorkerReplyError("The proposed action needs a file that does not exist", "proposal",
@@ -788,20 +803,26 @@ class Engine:
         db.execute("INSERT INTO runs(task,step,bot,at,state,result) VALUES(?,?,?,?,?,?)",
                    (task, step, bot, time.time(), state, encode(result)))
 
-    def complete(self, task, row, profile, reply):
+    def complete(self, task, row, profile, reply, *, mode="live"):
+        name = row["id"]
+        workspace = self.projects / task
+        github_build = mode == GITHUB_MODE and name == "build"
         try:
             summary = text_arg(reply, "summary", 8000)
-            artifacts = reply.get("artifacts", [])
-            if not isinstance(artifacts, list) or len(artifacts) > 12:
+            if github_build:
+                artifacts = self.github.build_artifacts(workspace, json.loads(row["observations"]))
+            else:
+                artifacts = reply.get("artifacts", [])
+            if not isinstance(artifacts, list) or (not github_build and len(artifacts) > 12):
                 raise ValueError("Invalid artifact list")
-            missing = [artifact for artifact in artifacts
-                       if not path_under(self.projects / task, artifact).is_file()]
+            missing = [artifact for artifact in artifacts if not path_under(workspace, artifact).is_file()]
             review = row["review_of"] is not None
             if review and reply.get("verdict") not in ("pass", "fail"):
                 raise ValueError("Reviewer must return a pass or fail verdict")
-        except ValueError as exc:
-            raise WorkerReplyError(str(exc), "completion",
-                                   {"guidance": "Correct the result using the completion contract."}) from exc
+        except (ValueError, FileNotFoundError) as exc:
+            guidance = ("Use the write tool with an allowed changes path. Return a summary after it saves an artifact."
+                        if github_build else "Correct the result using the completion contract.")
+            raise WorkerReplyError(str(exc), "completion", {"guidance": guidance}) from exc
         if missing:
             raise WorkerReplyError("Worker named a missing artifact: " + missing[0], "completion", {
                 "missing": missing,
@@ -809,7 +830,6 @@ class Engine:
                             "Use the workspace-relative artifact path returned by the tool. "
                             "List only files that exist when you finish.",
             })
-        name = row["id"]
         result = {"summary": summary, "artifacts": artifacts}
         if review:
             result["verdict"] = reply["verdict"]

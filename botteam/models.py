@@ -70,6 +70,16 @@ class Model:
     def worker(self, task, profile, context):
         if self.offline:
             return demo_worker(context)
+        if "editable_files" in context:
+            return self.call(task, profile, profile["persona"] + " Return exactly one JSON object per turn. "
+                             'First read the issue with {"tool":"read","args":{"path":"steps/checkout/issue.md"}}. '
+                             "Read the relevant editable_files read path and inspect its text in observations. "
+                             "To save a small edit, use write with the corresponding write path. Example: "
+                             '{"tool":"write","args":{"path":"changes/app.py","old":"return 1","new":"return 2"}}. '
+                             "Use exact source text for old, including spaces and newlines. "
+                             "Use multiple writes if needed. Fix validation errors or review feedback. "
+                             'Once write succeeds, return {"summary":"What you changed"}. '
+                             "The workflow collects saved files and runs tests. Use only the listed tools.", context)
         return self.call(task, profile, profile["persona"] + " Return one JSON object. To use a tool, return "
                          '{"tool":"name","args":{...}}. To finish, return {"summary":"...",'
                          '"artifacts":["workspace-relative paths"],"verdict":"pass or fail for review only"}. '

@@ -21,6 +21,7 @@ TESTS = "steps/review/tests.txt"
 TOOLS_BY_STEP = {"checkout": "github_checkout", "review": "github_verify", "draft": "github_draft"}
 TOOLS = frozenset(TOOLS_BY_STEP.values())
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+BUILD_CHANGES = "steps/build/changes"
 
 
 def digest(data):
@@ -84,10 +85,10 @@ class GitHubWorkflow:
             {"id": "checkout", "capability": "research", "depends_on": [],
              "instruction": "Read the GitHub issue and fetch the configured files at a pinned commit."},
             {"id": "build", "capability": "build", "depends_on": ["checkout"],
-             "instruction": "Read the issue and manifest in steps/checkout. Read originals under steps/checkout/source. "
-                            "Implement only a benign software change requested by the issue. Write replacement text "
-                            "files as changes/<repository-relative path>, using only editable_paths in the manifest. "
-                            "The workflow runs its own sandbox tests and checks the exact diff."},
+             "instruction": "Read steps/checkout/issue.md and the relevant source files. Implement only the benign "
+                            "change requested by the issue. Use write to save the edit to an allowed changes path. "
+                            "For a small edit, give the exact old text and its replacement. "
+                            "Finish after write returns an artifact. The workflow runs sandbox tests and review."},
             {"id": "review", "capability": "review", "depends_on": ["checkout", "build"], "review_of": "build",
              "instruction": "Read the issue, steps/review/proposed.diff and steps/review/tests.txt. Check that "
                             "the tested diff meets the issue and review it independently. Report pass or fail."},
@@ -181,6 +182,37 @@ class GitHubWorkflow:
         return {"summary": f"Checked out issue #{number} at {base[:12]}. Read the issue and manifest.",
                 "artifacts": [ISSUE, MANIFEST]}
 
+    def build_write_args(self, workspace, args):
+        paths = {f"changes/{name}": name for name in self.recipe["editable_paths"]}
+        path = args.get("path")
+        if not isinstance(path, str) or path not in paths:
+            raise ValueError("Use an allowed write path: " + ", ".join(paths)[:500])
+        name = paths[path]
+        original = path_under(workspace / "steps/checkout/source", name)
+        staged = path_under(workspace / BUILD_CHANGES, name)
+        before = read_bytes(staged if staged.exists() else original).decode("utf-8")
+        if "old" in args or "new" in args:
+            old, new = args.get("old"), args.get("new")
+            if "content" in args or not isinstance(old, str) or not old or not isinstance(new, str):
+                raise ValueError("Supply old and new text for an edit, or content for a full replacement")
+            start = before.find(old)
+            if start < 0 or before.find(old, start + 1) >= 0:
+                raise ValueError("The old text must match exactly once. Read the current file and include nearby lines.")
+            content = before[:start] + new + before[start + len(old):]
+        else:
+            content = args.get("content")
+            if not isinstance(content, str):
+                raise ValueError("write requires text content or an exact old/new edit")
+        if content == before or "\0" in content:
+            raise ValueError("The proposed edit must change the file and remain plain text")
+        return {"path": path, "content": content}
+
+    def build_artifacts(self, workspace, observations):
+        if not any(item["tool"] == "write" and item["result"].get("artifact") for item in observations):
+            raise ValueError("The builder must use write to save a changed file before completing this attempt")
+        _, _, changes = self.source_and_changes(workspace)
+        return [f"{BUILD_CHANGES}/{name}" for name in changes]
+
     def source_and_changes(self, workspace):
         manifest = json.loads(read_bytes(workspace / MANIFEST))
         if manifest["repo"] != self.repo or manifest["recipe_sha256"] != digest(encode(self.recipe).encode()):
@@ -192,7 +224,7 @@ class GitHubWorkflow:
                 raise ValueError("The checked-out source snapshot changed")
             source[name] = data
         changes = {}
-        root = workspace / "steps/build/changes"
+        root = workspace / BUILD_CHANGES
         for file in sorted(root.rglob("*")):
             if file.is_symlink():
                 raise ValueError("Symlinks are not allowed in the proposed changes")

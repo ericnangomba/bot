@@ -63,15 +63,24 @@ class FixtureGitHub:
 
 class FixtureModel:
     offline = False
+    premature_completion = False
 
     def worker(self, task, profile, context):
         if context["step"] == "review":
             assert context["observations"][-1]["result"]["exit_code"] == 0
             return {"summary": "The implementation matches the issue.", "verdict": "pass"}
-        if not context["observations"]:
-            value = 2 if context["review_feedback"] else 0
-            return {"tool": "write", "args": {"path": "changes/app.py", "content": f"def total():\n    return {value}\n"}}
-        return {"summary": "Saved the change.", "artifacts": ["steps/build/changes/app.py"]}
+        observations = context["observations"]
+        if not observations and self.premature_completion:
+            return {"summary": "Failed to complete step due to missing artifact."}
+        if not observations or observations[-1]["tool"] == "completion_validation":
+            assert context["editable_files"][0]["write"] == "changes/app.py"
+            repair = bool(context["review_feedback"])
+            if repair:
+                assert context["editable_files"][0]["read"] == "steps/build/changes/app.py"
+            return {"tool": "write", "args": {"path": "changes/app.py",
+                                               "old": "return 0" if repair else "return 1",
+                                               "new": "return 2" if repair else "return 0"}}
+        return {"summary": "Saved the change.", "artifacts": ["changes/app.py"]}
 
 
 @unittest.skipUnless(os.environ.get("BOTTEAM_TEST_DOCKER") == "1", "set BOTTEAM_TEST_DOCKER=1 for the Docker E2E")
@@ -115,6 +124,7 @@ class GitHubWorkflowTests(unittest.TestCase):
         return pending[0]
 
     def test_git_issue_repairs_failed_tests_and_publishes_tested_patch(self):
+        self.engine.model.premature_completion = True
         client = Mock()
         telegram = Telegram(self.engine, client, {123})
         scope = Scope(123, 123)
@@ -131,6 +141,10 @@ class GitHubWorkflowTests(unittest.TestCase):
         view = self.engine.task_view(task)
         review = next(step for step in view["steps"] if step["id"] == "review")
         self.assertEqual(review["repairs"], 1)
+        build = next(step for step in view["steps"] if step["id"] == "build")
+        self.assertEqual(build["result"]["artifacts"], ["steps/build/changes/app.py"])
+        self.assertEqual([item["tool"] for item in build["observations"]],
+                         ["completion_validation", "write"])
         self.assertEqual(decision["action"]["args"]["base_sha"], BASE)
         self.assertEqual(decision["action"]["args"]["files"], ["app.py"])
         self.engine.approval(decision["id"], "approve", "")
