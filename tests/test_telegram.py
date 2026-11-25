@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -142,6 +143,36 @@ class TestTelegram(unittest.TestCase):
                 db.execute("UPDATE schedules SET next_at=0")
             self.engine.fire_schedules()
             self.assertEqual(len(self.gateway.lookup(Scope(123, 123))), 1)
+
+    def test_delivery_continues_while_get_updates_waits(self):
+        polling, release, delivered = threading.Event(), threading.Event(), threading.Event()
+        original_call = self.client.call
+
+        def call(method, payload, **kwargs):
+            if method == "getMe":
+                return {"username": "fixture"}
+            if method == "getUpdates":
+                polling.set()
+                release.wait(8)
+                return []
+            if method == "sendMessage" and "· completed" in payload["text"]:
+                delivered.set()
+            return original_call(method, payload, **kwargs)
+
+        self.client.call = call
+        self.gateway.start()
+        try:
+            self.assertTrue(polling.wait(3))
+            task = self.engine.submit("Draft example", "demo", {}, telegram_scope=(123, 123, 0))
+            with self.engine.store.tx() as db:
+                db.execute("UPDATE tasks SET status='completed',summary='Ready' WHERE id=?", (task,))
+                event(db, task, "task_completed", {"summary": "Ready"})
+            self.assertTrue(delivered.wait(3), "Delivery waited for the incoming long poll")
+            self.assertFalse(release.is_set())
+        finally:
+            self.gateway.stop.set()
+            release.set()
+            self.gateway.close()
 
 
 if __name__ == "__main__":

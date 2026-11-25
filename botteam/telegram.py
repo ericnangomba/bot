@@ -127,6 +127,7 @@ class Telegram:
         self.voice_seconds = voice_seconds
         self.stop = threading.Event()
         self.thread = None
+        self.delivery_thread = None
         self.username = ""
         self.last_poll = 0.0
 
@@ -158,12 +159,16 @@ class Telegram:
 
     def start(self):
         self.thread = threading.Thread(target=self.run, daemon=True, name="telegram")
+        self.delivery_thread = threading.Thread(target=self.run_delivery, daemon=True, name="telegram-delivery")
         self.thread.start()
+        self.delivery_thread.start()
 
     def close(self):
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=2)
+        if self.delivery_thread:
+            self.delivery_thread.join(timeout=2)
 
     def value(self, key):
         with self.engine.store.tx(write=False) as db:
@@ -181,7 +186,6 @@ class Telegram:
             try:
                 if not self.username:
                     self.username = self.client.call("getMe", {})["username"].lower()
-                self.deliver_events()
                 updates = self.client.call("getUpdates", {"offset": self.value("update") + 1,
                     "timeout": 10, "limit": 20, "allowed_updates": ["message", "callback_query"]})
                 self.last_poll = time.monotonic()
@@ -200,6 +204,19 @@ class Telegram:
                 failures += 1
                 LOG.warning("Telegram polling failed (%s)", type(exc).__name__)
                 self.stop.wait(min(60, 2 ** min(failures, 6)))
+
+    def run_delivery(self):
+        failures = 0
+        while not self.stop.is_set():
+            try:
+                self.deliver_events()
+            except Exception as exc:
+                failures += 1
+                LOG.warning("Telegram delivery failed (%s)", type(exc).__name__)
+                self.stop.wait(min(60, 2 ** min(failures, 6)))
+            else:
+                failures = 0
+                self.stop.wait(1)
 
     def scope(self, sender, message):
         user, chat = sender.get("id"), message.get("chat", {})
@@ -477,10 +494,12 @@ class Telegram:
 
     def logs(self, scope, task):
         with self.engine.store.tx(write=False) as db:
-            rows = db.execute("SELECT seq,step,kind,data FROM events WHERE task=? ORDER BY seq DESC LIMIT 40",
+            created = self.engine.task_row(db, task)["created"]
+            rows = db.execute("SELECT seq,at,step,kind,data FROM events WHERE task=? ORDER BY seq DESC LIMIT 40",
                               (task,)).fetchall()
         lines = [f"Latest events for {task[:8]}"]
-        lines.extend(f"{row['seq']} {row['step'] or 'director'} {row['kind']} {row['data']}"
+        lines.extend(f"{row['seq']} +{max(0, row['at'] - created):.1f}s "
+                     f"{row['step'] or 'director'} {row['kind']} {row['data']}"
                      for row in reversed(rows))
         self.output(scope, "\n".join(lines), f"{task[:8]}-logs.txt")
 
