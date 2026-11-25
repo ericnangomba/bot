@@ -247,6 +247,39 @@ class TestEngine(unittest.TestCase):
         self.assertIn("missing artifact: greeting.md", view["summary"])
         self.assertEqual(view["artifacts"], [])
 
+    def test_worker_corrects_disallowed_tool_without_starting_it(self):
+        task = self.artifact_step()
+        self.engine.model = Mock(offline=False)
+        self.engine.model.worker.side_effect = [
+            {"tool": "publish", "args": {"path": "greeting.md"}},
+            {"tool": "write", "args": {"path": "greeting.md", "content": "Hello!"}},
+            {"summary": "Wrote the greeting", "artifacts": ["steps/report/greeting.md"]},
+        ]
+        self.worker_turn(task)
+        view = self.engine.task_view(task)
+        self.assertIsNone(view["steps"][0]["action"])
+        self.assertEqual(view["approvals"], [])
+        self.assertEqual(view["steps"][0]["state"], "queued")
+        self.worker_turn(task)
+        feedback = self.engine.model.worker.call_args.args[2]["observations"][-1]
+        self.assertEqual(feedback["tool"], "proposal_validation")
+        self.worker_turn(task)
+        self.worker_turn(task)
+        view = self.engine.task_view(task)
+        self.assertEqual(view["steps"][0]["state"], "completed")
+        self.assertEqual(view["artifacts"], ["steps/report/greeting.md"])
+
+    def test_invalid_proposal_and_completion_share_the_correction_limit(self):
+        task = self.artifact_step()
+        self.engine.model = Mock(offline=False)
+        self.engine.model.worker.side_effect = [{"tool": "write", "args": "invalid"}, {"summary": ""}]
+        self.worker_turn(task)
+        self.worker_turn(task)
+        view = self.engine.task_view(task)
+        self.assertEqual(view["status"], "failed")
+        self.assertEqual(view["steps"][0]["turns"], 1)
+        self.assertEqual(view["artifacts"], [])
+
     def test_invalid_dag_is_rejected(self):
         plan = {"steps": [
             {"id": "a", "capability": "build", "depends_on": ["b"], "instruction": "Build"},

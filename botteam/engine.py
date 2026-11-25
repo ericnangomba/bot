@@ -20,10 +20,18 @@ LOG = logging.getLogger("botteam")
 TERMINAL = {"completed", "failed", "cancelled"}
 MUTATING = GATED | {"write", "patch", "exec"}
 MAX_GOAL = 7000
+REPLY_FEEDBACK = {"completion_validation", "proposal_validation"}
 
 
 class Conflict(ValueError):
     pass
+
+
+class WorkerReplyError(ValueError):
+    def __init__(self, reason, phase, feedback=None):
+        super().__init__(reason)
+        self.phase = phase
+        self.feedback = feedback or {}
 
 
 def fields(row, *names):
@@ -40,7 +48,7 @@ def decode(row, *names):
 
 def last_clarification(observations):
     for observation in reversed(observations):
-        if observation["tool"] == "completion_validation":
+        if observation["tool"] in REPLY_FEEDBACK:
             continue
         if observation["tool"] == "clarify" and observation["result"].get("answer"):
             return observation["result"]
@@ -566,9 +574,12 @@ class Engine:
             with self.store.tx() as db:
                 current = db.execute("SELECT * FROM steps WHERE task=? AND id=?", (task_id, name)).fetchone()
                 terminal = self.task_row(db, task_id)["status"] in TERMINAL
-                if not terminal and not current["effect"] and self.defer(db, task_id, name, current["attempts"], exc):
-                    self.refresh(db, task_id)
-                    return
+                if not terminal and not current["effect"]:
+                    if isinstance(exc, WorkerReplyError) and self.repair_worker_reply(db, current, exc):
+                        return
+                    if self.defer(db, task_id, name, current["attempts"], exc):
+                        self.refresh(db, task_id)
+                        return
                 message = str(exc)[:700] or type(exc).__name__
                 if current["effect"]:
                     message = "External action outcome may be uncertain. Inspect its destination. " + message
@@ -578,6 +589,20 @@ class Engine:
                 self.log_run(db, task_id, name, profile["id"], "failed", {"summary": message})
                 if not terminal:
                     self.fail_task(db, task_id, f"{name} failed: {message}")
+
+    def repair_worker_reply(self, db, row, error):
+        observations = json.loads(row["observations"])
+        if (row["turns"] + 1 >= self.policy["max_turns"] or
+                (observations and observations[-1]["tool"] in REPLY_FEEDBACK)):
+            return False
+        reason = str(error)[:700]
+        feedback = {"error": reason, **error.feedback}
+        observations.append({"tool": error.phase + "_validation", "result": feedback})
+        db.execute("UPDATE steps SET state='queued',observations=?,turns=turns+1,attempts=0,ready=0 "
+                   "WHERE task=? AND id=?", (encode(observations), row["task"], row["id"]))
+        event(db, row["task"], error.phase + "_rejected", {"reason": reason, **error.feedback}, row["id"])
+        self.refresh(db, row["task"])
+        return True
 
     def stopped_before_claim(self, db, task, step):
         current = self.task_row(db, task)
@@ -591,13 +616,21 @@ class Engine:
         name = reply["tool"]
         args = reply.get("args")
         if not isinstance(name, str) or name not in self.allowed_tools(profile, row["capability"]):
-            raise ValueError("Worker requested a tool outside its policy")
-        if not isinstance(args, dict) or len(encode(args).encode()) > 60000:
-            raise ValueError("Invalid or oversized tool arguments")
-        if name == "clarify":
-            text_arg(args, "question", 1500)
+            raise WorkerReplyError("Worker requested a tool outside its policy", "proposal",
+                                   {"guidance": "Choose a tool from the tools available to this step."})
         step = row["id"]
-        action = bind_action(name, args, self.projects / task, self.policy)
+        try:
+            if not isinstance(args, dict) or len(encode(args).encode()) > 60000:
+                raise ValueError("Invalid or oversized tool arguments")
+            if name == "clarify":
+                text_arg(args, "question", 1500)
+            action = bind_action(name, args, self.projects / task, self.policy)
+        except FileNotFoundError as exc:
+            raise WorkerReplyError("The proposed action needs a file that does not exist", "proposal",
+                                   {"guidance": "Use an existing workspace path or prepare the file first."}) from exc
+        except ValueError as exc:
+            raise WorkerReplyError(str(exc), "proposal",
+                                   {"guidance": "Correct the arguments using the tool contract."}) from exc
         action["nonce"] = uuid.uuid4().hex
         with self.store.tx() as db:
             if self.task_row(db, task)["status"] in TERMINAL:
@@ -695,41 +728,33 @@ class Engine:
                    (task, step, bot, time.time(), state, encode(result)))
 
     def complete(self, task, row, profile, reply):
-        summary = text_arg(reply, "summary", 8000)
-        artifacts = reply.get("artifacts", [])
-        if not isinstance(artifacts, list) or len(artifacts) > 12:
-            raise ValueError("Invalid artifact list")
-        missing = [artifact for artifact in artifacts
-                   if not path_under(self.projects / task, artifact).is_file()]
+        try:
+            summary = text_arg(reply, "summary", 8000)
+            artifacts = reply.get("artifacts", [])
+            if not isinstance(artifacts, list) or len(artifacts) > 12:
+                raise ValueError("Invalid artifact list")
+            missing = [artifact for artifact in artifacts
+                       if not path_under(self.projects / task, artifact).is_file()]
+            review = row["review_of"] is not None
+            if review and reply.get("verdict") not in ("pass", "fail"):
+                raise ValueError("Reviewer must return a pass or fail verdict")
+        except ValueError as exc:
+            raise WorkerReplyError(str(exc), "completion",
+                                   {"guidance": "Correct the result using the completion contract."}) from exc
+        if missing:
+            raise WorkerReplyError("Worker named a missing artifact: " + missing[0], "completion", {
+                "missing": missing,
+                "guidance": "If the step calls for a file, create it with an available workspace tool. "
+                            "Use the workspace-relative artifact path returned by the tool. "
+                            "List only files that exist when you finish.",
+            })
         name = row["id"]
         result = {"summary": summary, "artifacts": artifacts}
-        review = row["review_of"] is not None
-        if review and reply.get("verdict") not in {"pass", "fail"}:
-            raise ValueError("Reviewer must return a pass or fail verdict")
         if review:
             result["verdict"] = reply["verdict"]
         with self.store.tx() as db:
             if self.task_row(db, task)["status"] in TERMINAL:
                 db.execute("UPDATE steps SET state='queued' WHERE task=? AND id=?", (task, name))
-                return
-            if missing:
-                observations = json.loads(row["observations"])
-                error = "Worker named a missing artifact: " + missing[0]
-                if (row["turns"] + 1 >= self.policy["max_turns"] or
-                        (observations and observations[-1]["tool"] == "completion_validation")):
-                    raise ValueError(error)
-                feedback = {
-                    "error": error,
-                    "missing": missing,
-                    "guidance": "If the step calls for a file, create it with an available workspace tool. "
-                                "Use the workspace-relative artifact path returned by the tool. "
-                                "List only files that exist when you finish.",
-                }
-                observations.append({"tool": "completion_validation", "result": feedback})
-                db.execute("UPDATE steps SET state='queued',observations=?,turns=turns+1,attempts=0,ready=0 "
-                           "WHERE task=? AND id=?", (encode(observations), task, name))
-                event(db, task, "completion_rejected", {"missing": missing}, name)
-                self.refresh(db, task)
                 return
             if result.get("verdict") == "fail":
                 self.log_run(db, task, name, profile["id"], "rejected", result)
